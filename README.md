@@ -9,6 +9,7 @@ npx bagn --yolo                   # claude --dangerously-skip-permissions
 npx bagn --shell                  # bash in the container instead of claude
 npx bagn --cursor                 # Cursor CLI instead of claude
 npx bagn --sf                     # image with the Salesforce CLI too
+npx bagn --sf-org myscratch       # ...and copy an org's login from your sf
 npx bagn --help                   # all options
 npx bagn -- -p "summarize this"   # everything after -- goes to claude as is
 ```
@@ -37,6 +38,7 @@ container stops when its last session ends, and the next run starts it again.
 | `--shell` | Open `bash` in the container instead of `claude`. Combines with `--pick`/`--new` |
 | `--cursor` | Run the Cursor CLI (`cursor-agent`) instead of `claude` |
 | `--sf` | Use an image that also has the Salesforce CLI (`sf`). Built on first use |
+| `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the containers' `sf`, keeping its alias. Repeatable. Implies `--sf` |
 | `--prune` | Remove all stopped bagn containers |
 
 A container is only reused if it was built from the current image and the folder's
@@ -64,10 +66,28 @@ once with `bagn --cursor -- login`. The login is kept in the Docker volume
 The Salesforce CLI (`sf`) is in a separate image, `claude-box:<version>-sf`, built the
 first time you pass `--sf`. Containers made with `--sf` are separate from the
 others in the same folder. `--pick` reuses a container with whatever it was
-made with. Log in from a `bagn --sf --shell` session with
-`sf org login device` (or `sf org login jwt`/`sf org login sfdx-url`). `sf org login web`
-doesn't work, because it waits for a callback on the container's localhost, which your
-browser can't reach. The login is kept in the volume `claude-box-sf`.
+made with. Logins are kept in the volume `claude-box-sf`, so every `--sf` container has them.
+
+To use an org you're already logged in to on your computer (e.g. a scratch org), copy its
+login in:
+
+```sh
+bagn --sf-org myscratch                   # copy the login, then start claude
+bagn --sf-org myscratch --sf-org DevHub   # several orgs, e.g. its Dev Hub too
+```
+
+This reads the org's SFDX auth URL from `sf` on your computer (`sf org auth show-sfdx-auth-url`,
+or `sf org display --verbose` on older versions) and passes it on stdin to
+`sf org login sfdx-url` in the container, under the same alias. Your project's
+`.sf/config.json` (`target-org`, `target-dev-hub`) then works unchanged. Run it again
+after re-authorizing an org. It only works for orgs logged in with a web login (they have
+a refresh token). Orgs authorized with JWT, including scratch orgs created from a
+JWT-authorized Dev Hub, can't be copied. Mounting your `~/.sfdx` wouldn't work either, because on
+macOS those tokens are encrypted with a key in your Keychain.
+
+To log in from inside the container instead, use `sf org login device` (or
+`sf org login jwt`) in a `bagn --sf --shell` session. `sf org login web` doesn't work, because
+it waits for a callback on the container's localhost, which your browser can't reach.
 
 The Docker image and volume names still start with `claude-box`, so logins and
 containers from before the rename carry over.

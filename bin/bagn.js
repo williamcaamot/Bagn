@@ -61,6 +61,10 @@ Options:
   --shell       Open a bash shell in the container instead of claude
   --cursor      Run the Cursor CLI (cursor-agent) instead of claude
   --sf          Use an image with the Salesforce CLI (sf) installed
+  --sf-org <org>
+                Copy the login for an org (alias or username) from sf on this
+                computer into the containers' sf, keeping its alias. Repeat
+                for more orgs. Implies --sf
   --prune       Remove all stopped bagn containers
   --api-key     Pass ANTHROPIC_API_KEY from your shell into the session
                 (default: nothing from your environment is passed)
@@ -105,6 +109,7 @@ const FLAGS = {
 
 function parseArgs(argv) {
   const opts = Object.fromEntries(Object.values(FLAGS).map((key) => [key, false]));
+  opts.sfOrgs = [];
   const passArgs = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -114,6 +119,13 @@ function parseArgs(argv) {
     }
     if (FLAGS[arg]) {
       opts[FLAGS[arg]] = true;
+      continue;
+    }
+    if (arg === '--sf-org' || arg.startsWith('--sf-org=')) {
+      const value = arg === '--sf-org' ? argv[++i] : arg.slice('--sf-org='.length);
+      if (!value || value.startsWith('-')) fail('--sf-org needs an org alias or username');
+      opts.sfOrgs.push(value);
+      opts.sf = true;
       continue;
     }
     // Options were called --box-<name> before they were shortened.
@@ -411,6 +423,72 @@ function execArgs(name, opts, command) {
   return args;
 }
 
+// sf error messages wrap the reason in lines like "Parsing --target-org" and
+// "See more help with --help", and can contain a whole HTML error page.
+function sfMessage(msg) {
+  const lines = String(msg || '').split('\n').map((l) => l.trim())
+    .filter((l) => l && !/^(Parsing |See more help)/.test(l));
+  return (lines[0] || '').slice(0, 200);
+}
+
+// Runs sf on the host with --json and returns its parsed output.
+function hostSf(args, env = {}) {
+  const res = spawnSync('sf', [...args, '--json'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    env: { ...process.env, ...env },
+  });
+  if (res.error) fail('--sf-org needs the Salesforce CLI (sf) installed on this computer');
+  try {
+    return JSON.parse(res.stdout);
+  } catch {
+    return { status: res.status || 1 };
+  }
+}
+
+// Reads an org's login from sf on the host. The sfdxAuthUrl holds a refresh
+// token, which works anywhere, unlike the host's stored tokens: on macOS those
+// are encrypted with a key in the Keychain.
+function exportSfOrg(org) {
+  // Older sf versions include the URL here. Newer ones redact it unless
+  // SF_TEMP_SHOW_SECRETS is set, and will stop showing it at all, so then
+  // 'sf org auth show-sfdx-auth-url' is used instead.
+  const info = hostSf(['org', 'display', '--target-org', org, '--verbose'], { SF_TEMP_SHOW_SECRETS: 'true' });
+  if (info.status !== 0 || !info.result) {
+    fail(`sf on this computer: ${sfMessage(info.message) || `could not read org ${org}`}`);
+  }
+  const { alias, username } = info.result;
+  let url = info.result.sfdxAuthUrl;
+  if (!url?.startsWith('force://')) url = hostSf(['org', 'auth', 'show-sfdx-auth-url', '--target-org', org]).result?.sfdxAuthUrl;
+  if (!url?.startsWith('force://')) {
+    fail(`${org} has no refresh token to copy. Orgs authorized with JWT (including scratch orgs created from a JWT-authorized Dev Hub) don't have one.`);
+  }
+  return { org, url, alias: alias || (org !== username ? org : null) };
+}
+
+function importArgs(name, org) {
+  const args = ['exec', '-i', name, 'sf', 'org', 'login', 'sfdx-url', '--sfdx-url-stdin', '-', '--json'];
+  if (org.alias) args.push('--alias', org.alias);
+  return args;
+}
+
+// The URL goes in on stdin so the refresh token never appears in a process list.
+function importSfOrg(name, org) {
+  const res = spawnSync('docker', importArgs(name, org), { input: org.url, encoding: 'utf8' });
+  if (res.status === 0) return null;
+  let msg;
+  try {
+    msg = JSON.parse(res.stdout).message;
+  } catch {
+    msg = res.stderr;
+  }
+  return sfMessage(msg) || 'sf org login failed';
+}
+
+function stopIfIdle(name) {
+  if (sessionCount(name) === 0) docker(['stop', '-t', '2', name], 'ignore');
+}
+
 function main() {
   const { opts, passArgs } = parseArgs(process.argv.slice(2));
   if (opts.help) {
@@ -432,6 +510,10 @@ function main() {
     printSecrets(secrets);
     const name = containerName(cwd);
     console.log(['docker', ...createArgs(name, cwd, secrets, opts.sf)].map(shellQuote).join(' '));
+    for (const org of opts.sfOrgs) {
+      const args = importArgs(name, { alias: org });
+      console.log(`${['docker', ...args].map(shellQuote).join(' ')} < (sfdxAuthUrl from: sf org display -o ${shellQuote(org)} --verbose)`);
+    }
     console.log(['docker', ...execArgs(name, opts, command)].map(shellQuote).join(' '));
     return;
   }
@@ -453,9 +535,13 @@ function main() {
     return;
   }
 
+  // Read host logins first, so a missing org fails before any docker work.
+  const orgs = opts.sfOrgs.map(exportSfOrg);
+
   let target = opts.pick ? pickContainer(listContainers({ sessions: true }), cwd) : null;
   // A picked container keeps its own image variant.
   const sf = target ? target.sf : opts.sf;
+  if (orgs.length && !sf) fail(`${target.name} has no Salesforce CLI; pick an sf container or use --new`);
   const image = sf ? SF_IMAGE : IMAGE;
   ensureImage(image, sf, opts.rebuild);
   const imageId = dockerOut(['image', 'inspect', '-f', '{{.Id}}', image]);
@@ -493,10 +579,19 @@ function main() {
     if (docker(createArgs(name, folder, secrets, sf), 'ignore').status !== 0) fail('docker run failed');
   }
 
+  for (const org of orgs) {
+    const err = importSfOrg(name, org);
+    if (err) {
+      stopIfIdle(name);
+      fail(`could not link org ${org.org}: ${err}`);
+    }
+    console.error(`bagn: linked org ${org.alias || org.org}`);
+  }
+
   const res = docker(execArgs(name, opts, command));
   // Stop the container once its last session ends; it is started again on
   // the next reuse. Background processes left in it are stopped too.
-  if (sessionCount(name) === 0) docker(['stop', '-t', '2', name], 'ignore');
+  stopIfIdle(name);
   process.exit(res.status ?? 1);
 }
 
