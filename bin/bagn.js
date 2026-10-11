@@ -9,12 +9,26 @@ const path = require('node:path');
 
 const pkg = require('../package.json');
 
+// Docker images, volumes and labels keep the original claude-box names so
+// existing logins and containers carry over.
 const IMAGE = `claude-box:${pkg.version}`;
+const SF_IMAGE = `claude-box:${pkg.version}-sf`;
 const CONFIG_VOLUME = 'claude-box-config';
-const WORKDIR = '/workspace';
+const CURSOR_VOLUME = 'claude-box-cursor';
+const SF_VOLUME = 'claude-box-sf';
 const IGNORE_FILE = '.claudeboxignore';
 const LABEL_FOLDER = 'claude-box.folder';
-const LABEL_MASKS = 'claude-box.masks';
+const LABEL_MOUNTS = 'claude-box.mounts';
+const LABEL_SF = 'claude-box.sf';
+
+// Folders are mounted at their host path, except where that would shadow the
+// image's own directories or sit somewhere the container user can't reach.
+const FALLBACK_ROOT = '/workspace';
+const RESERVED_TREES = [
+  '/bin', '/boot', '/dev', '/etc', '/lib', '/lib32', '/lib64', '/libx32', '/proc',
+  '/root', '/run', '/sbin', '/sys', '/usr', '/var', '/claude-config',
+];
+const RESERVED_DIRS = new Set(['/', '/home', '/home/node', '/opt', '/tmp']);
 
 // Files/dirs hidden from the container. Matched against the basename, or
 // against the relative path when the pattern contains a '/'.
@@ -33,30 +47,38 @@ const SKIP_DIRS = new Set([
   '.venv', 'venv', '__pycache__', 'target', '.cache',
 ]);
 
-const HELP = `claude-box ${pkg.version}
+const HELP = `bagn ${pkg.version}
 Run Claude Code in Docker with only the current folder mounted.
 
-Usage: claude-box [box options] [claude args...]
+Usage: bagn [box options] [claude args...]
+       bagn [box options] -- [claude args...]
 
 Box options:
-  --box-list        List claude-box containers, most recently used first
+  --box-list        List bagn containers, most recently used first
   --box-pick        Choose a container to reuse from the list, or start a new one
   --box-new         Start a new container instead of reusing this folder's
   --box-shell       Open a bash shell in the container instead of claude
-  --box-prune       Remove all stopped claude-box containers
+  --box-cursor      Run the Cursor CLI (cursor-agent) instead of claude
+  --box-sf          Use an image with the Salesforce CLI (sf) installed
+  --box-prune       Remove all stopped bagn containers
   --box-api-key     Pass ANTHROPIC_API_KEY from your shell into the session
                     (default: nothing from your environment is passed)
   --box-rebuild     Rebuild the Docker image (e.g. to update Claude Code)
   --box-dry-run     Print the docker commands and masked files, don't run
   --box-force       Allow running in your home directory or /
-  --box-help        Show this help
+  -h, --help        Show this help (also --box-help)
 
 By default the most recent container for the current folder is reused, so
 several terminals in one folder share a container. A container is not reused
 if the image was rebuilt or the set of hidden secret files changed.
 
-Any other arguments are forwarded to claude (or to bash with --box-shell), e.g.
-  claude-box --dangerously-skip-permissions
+The folder is mounted at the same path inside the container, so Claude Code
+keeps separate sessions and memory for each folder.
+
+Any other arguments are forwarded to claude (or to bash/cursor-agent), e.g.
+  bagn --dangerously-skip-permissions
+Everything after -- is forwarded as is, e.g. claude's own help:
+  bagn -- --help
 
 Secret files (.env, *.pem, ...) are replaced by empty read-only files inside
 the container. Add more patterns in a ${IGNORE_FILE} file; prefix a line
@@ -65,20 +87,27 @@ with ! to un-hide a file.`;
 function parseArgs(argv) {
   const opts = {
     apiKey: false, rebuild: false, dryRun: false, force: false, help: false,
-    list: false, pick: false, new: false, shell: false, prune: false,
+    list: false, pick: false, new: false, shell: false, prune: false, cursor: false, sf: false,
   };
   const claudeArgs = [];
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--') {
+      claudeArgs.push(...argv.slice(i + 1));
+      break;
+    }
     if (arg === '--box-list') opts.list = true;
     else if (arg === '--box-pick') opts.pick = true;
     else if (arg === '--box-new') opts.new = true;
     else if (arg === '--box-shell') opts.shell = true;
+    else if (arg === '--box-cursor') opts.cursor = true;
+    else if (arg === '--box-sf') opts.sf = true;
     else if (arg === '--box-prune') opts.prune = true;
     else if (arg === '--box-api-key') opts.apiKey = true;
     else if (arg === '--box-rebuild') opts.rebuild = true;
     else if (arg === '--box-dry-run') opts.dryRun = true;
     else if (arg === '--box-force') opts.force = true;
-    else if (arg === '--box-help') opts.help = true;
+    else if (arg === '--box-help' || arg === '--help' || arg === '-h') opts.help = true;
     else claudeArgs.push(arg);
   }
   return { opts, claudeArgs };
@@ -160,10 +189,14 @@ function dockerOut(args) {
   return res.status === 0 ? res.stdout.trim() : null;
 }
 
-function ensureImage(rebuild) {
-  if (!rebuild && docker(['image', 'inspect', IMAGE], 'ignore').status === 0) return;
-  console.error(`claude-box: building ${IMAGE}...`);
-  const res = docker(['build', '-t', IMAGE, path.join(__dirname, '..')]);
+function ensureImage(image, sf, rebuild) {
+  if (!rebuild && docker(['image', 'inspect', image], 'ignore').status === 0) return;
+  console.error(`bagn: building ${image}...`);
+  // On rebuild, skip the layer cache, which would otherwise keep the old
+  // Claude Code install, and pull the latest base image.
+  const cacheArgs = rebuild ? ['--pull', '--no-cache'] : [];
+  const sfArgs = sf ? ['--build-arg', 'INSTALL_SF=1'] : [];
+  const res = docker(['build', ...cacheArgs, ...sfArgs, '-t', image, path.join(__dirname, '..')]);
   if (res.status !== 0) fail('docker build failed');
 }
 
@@ -172,7 +205,7 @@ function shellQuote(s) {
 }
 
 function fail(msg) {
-  console.error(`claude-box: ${msg}`);
+  console.error(`bagn: ${msg}`);
   process.exit(1);
 }
 
@@ -195,21 +228,37 @@ function scanSecrets(folder) {
 
 function printSecrets(secrets) {
   if (!secrets.length) return;
-  console.error(`claude-box: hiding ${secrets.length} secret path(s) from the container:`);
+  console.error(`bagn: hiding ${secrets.length} secret path(s) from the container:`);
   for (const s of secrets) console.error(`  - ${s.rel}${s.dir ? '/' : ''}`);
 }
 
 // Mounts are fixed when a container is created, so a container may only be
-// reused while the folder's set of masked paths is unchanged.
-function masksHash(secrets) {
-  const key = secrets.map((s) => `${s.dir ? 'd' : 'f'}:${s.rel}`).sort().join('\n');
+// reused while its mount path and masked paths are unchanged.
+function mountsHash(workdir, secrets) {
+  const key = [workdir, ...secrets.map((s) => `${s.dir ? 'd' : 'f'}:${s.rel}`).sort()].join('\n');
   return crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
 }
 
-function containerName(folder) {
-  const base = path.basename(folder).toLowerCase()
+function slug(folder) {
+  return path.basename(folder).toLowerCase()
     .replace(/[^a-z0-9_.-]+/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 30) || 'folder';
-  return `claude-box-${base}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+function containerName(folder) {
+  return `bagn-${slug(folder)}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+// Claude Code keys sessions and memory by working directory, so mounting
+// every folder at one fixed path would mix them all together.
+function containerPath(folder) {
+  let p = folder;
+  if (process.platform === 'win32') {
+    p = `/${folder.replace(/^([A-Za-z]):/, (_, drive) => drive.toLowerCase()).replace(/\\/g, '/')}`;
+  }
+  const reserved = RESERVED_DIRS.has(p) || RESERVED_TREES.some((r) => p === r || p.startsWith(`${r}/`));
+  if (!reserved) return p;
+  const hash = crypto.createHash('sha256').update(folder).digest('hex').slice(0, 8);
+  return path.posix.join(FALLBACK_ROOT, `${slug(folder)}-${hash}`);
 }
 
 // Processes started with `docker exec` have no parent inside the container
@@ -241,8 +290,9 @@ function listContainers({ sessions = false } = {}) {
       running,
       lastUsed,
       folder: c.Config.Labels[LABEL_FOLDER],
-      masks: c.Config.Labels[LABEL_MASKS],
+      mounts: c.Config.Labels[LABEL_MOUNTS],
       image: c.Image,
+      sf: c.Config.Labels[LABEL_SF] === '1',
       sessions: sessions && running ? sessionCount(name) : 0,
     };
   });
@@ -262,6 +312,7 @@ function printContainers(containers, cwd) {
   containers.forEach((c, i) => {
     let status = `last used ${ago(c.lastUsed)}`;
     if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
+    if (c.sf) status += ', sf';
     rows.push([String(i + 1), c.name, status, c.folder === cwd ? `${c.folder} (here)` : c.folder]);
   });
   const widths = rows[0].map((_, col) => Math.max(...rows.map((r) => r[col].length)));
@@ -287,7 +338,7 @@ function prompt(question) {
 function pickContainer(containers, cwd) {
   if (!process.stdin.isTTY) fail('--box-pick needs an interactive terminal');
   if (!containers.length) {
-    console.error('claude-box: no existing containers, starting a new one');
+    console.error('bagn: no existing containers, starting a new one');
     return null;
   }
   printContainers(containers, cwd);
@@ -298,20 +349,25 @@ function pickContainer(containers, cwd) {
   return picked;
 }
 
-function createArgs(name, folder, secrets) {
+function createArgs(name, folder, secrets, sf) {
+  const workdir = containerPath(folder);
   const args = [
     'run', '-d', '--init', '--name', name,
     '--label', `${LABEL_FOLDER}=${folder}`,
-    '--label', `${LABEL_MASKS}=${masksHash(secrets)}`,
+    '--label', `${LABEL_MOUNTS}=${mountsHash(workdir, secrets)}`,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
-    '--mount', `type=bind,source=${folder},target=${WORKDIR}`,
+    '--mount', `type=bind,source=${folder},target=${workdir}`,
     '--mount', `type=volume,source=${CONFIG_VOLUME},target=/claude-config`,
-    '-w', WORKDIR,
+    '--mount', `type=volume,source=${CURSOR_VOLUME},target=/cursor-config`,
+    '-w', workdir,
   ];
+  if (sf) {
+    args.push('--label', `${LABEL_SF}=1`, '--mount', `type=volume,source=${SF_VOLUME},target=/sf-config`);
+  }
 
   for (const s of secrets) {
-    const target = path.posix.join(WORKDIR, s.rel);
+    const target = path.posix.join(workdir, s.rel);
     if (s.dir) args.push('--mount', `type=tmpfs,target=${target},tmpfs-mode=0555`);
     else args.push('--mount', `type=bind,source=/dev/null,target=${target},readonly`);
   }
@@ -323,7 +379,7 @@ function createArgs(name, folder, secrets) {
   }
 
   // The container only idles; each claude session is a separate docker exec.
-  args.push(IMAGE, 'sleep', 'infinity');
+  args.push(sf ? SF_IMAGE : IMAGE, 'sleep', 'infinity');
   return args;
 }
 
@@ -351,14 +407,18 @@ function main() {
   }
 
   const cwd = fs.realpathSync(process.cwd());
-  const command = opts.shell ? ['bash', ...claudeArgs] : ['claude', ...claudeArgs];
+  if (opts.shell && opts.cursor) fail('--box-shell and --box-cursor cannot be combined');
+  let program = 'claude';
+  if (opts.shell) program = 'bash';
+  else if (opts.cursor) program = 'cursor-agent';
+  const command = [program, ...claudeArgs];
 
   if (opts.dryRun) {
     checkFolder(cwd, opts.force);
     const secrets = scanSecrets(cwd);
     printSecrets(secrets);
     const name = containerName(cwd);
-    console.log(['docker', ...createArgs(name, cwd, secrets)].map(shellQuote).join(' '));
+    console.log(['docker', ...createArgs(name, cwd, secrets, opts.sf)].map(shellQuote).join(' '));
     console.log(['docker', ...execArgs(name, opts, command)].map(shellQuote).join(' '));
     return;
   }
@@ -368,40 +428,43 @@ function main() {
   if (opts.list) {
     const containers = listContainers({ sessions: true });
     if (containers.length) printContainers(containers, cwd);
-    else console.error('claude-box: no containers');
+    else console.error('bagn: no containers');
     return;
   }
 
   if (opts.prune) {
     const stopped = listContainers().filter((c) => !c.running).map((c) => c.name);
-    if (!stopped.length) console.error('claude-box: no stopped containers to remove');
+    if (!stopped.length) console.error('bagn: no stopped containers to remove');
     else if (docker(['rm', ...stopped], 'ignore').status !== 0) fail('docker rm failed');
-    else console.error(`claude-box: removed ${stopped.join(', ')}`);
+    else console.error(`bagn: removed ${stopped.join(', ')}`);
     return;
   }
 
-  ensureImage(opts.rebuild);
-  const imageId = dockerOut(['image', 'inspect', '-f', '{{.Id}}', IMAGE]);
-
   let target = opts.pick ? pickContainer(listContainers({ sessions: true }), cwd) : null;
+  // A picked container keeps its own image variant.
+  const sf = target ? target.sf : opts.sf;
+  const image = sf ? SF_IMAGE : IMAGE;
+  ensureImage(image, sf, opts.rebuild);
+  const imageId = dockerOut(['image', 'inspect', '-f', '{{.Id}}', image]);
+
   const folder = target ? target.folder : cwd;
   if (!target) checkFolder(folder, opts.force);
   else if (!fs.existsSync(folder)) fail(`${target.name}'s folder ${folder} no longer exists`);
   const secrets = scanSecrets(folder);
-  const hash = masksHash(secrets);
+  const hash = mountsHash(containerPath(folder), secrets);
 
   if (target) {
     if (target.image !== imageId) {
       fail(`${target.name} uses an older image. Run with --box-new to start a fresh container.`);
     }
-    if (target.masks !== hash) {
-      fail(`the secret files in ${folder} changed since ${target.name} was created. Run with --box-new from that folder.`);
+    if (target.mounts !== hash) {
+      fail(`${target.name}'s mounts are out of date (secret files in ${folder} changed, or bagn was updated). Run with --box-new from that folder.`);
     }
   } else if (!opts.new) {
-    const mine = listContainers().filter((c) => c.folder === folder);
-    target = mine.find((c) => c.image === imageId && c.masks === hash) || null;
+    const mine = listContainers().filter((c) => c.folder === folder && c.sf === sf);
+    target = mine.find((c) => c.image === imageId && c.mounts === hash) || null;
     if (!target && mine.length) {
-      console.error("claude-box: this folder's containers are out of date (image rebuilt or secret files changed)");
+      console.error("bagn: this folder's containers are out of date (image rebuilt, secret files changed, or bagn updated)");
     }
   }
 
@@ -409,12 +472,12 @@ function main() {
   let name;
   if (target) {
     name = target.name;
-    console.error(`claude-box: reusing container ${name}`);
+    console.error(`bagn: reusing container ${name}`);
     if (!target.running && docker(['start', name], 'ignore').status !== 0) fail(`could not start ${name}`);
   } else {
     name = containerName(folder);
-    console.error(`claude-box: starting new container ${name}`);
-    if (docker(createArgs(name, folder, secrets), 'ignore').status !== 0) fail('docker run failed');
+    console.error(`bagn: starting new container ${name}`);
+    if (docker(createArgs(name, folder, secrets, sf), 'ignore').status !== 0) fail('docker run failed');
   }
 
   const res = docker(execArgs(name, opts, command));

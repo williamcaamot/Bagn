@@ -1,9 +1,9 @@
 {
-  "name": "claude-box",
-  "version": "0.1.0",
+  "name": "bagn",
+  "version": "0.2.0",
   "description": "Run Claude Code in a Docker container scoped to the current folder, without leaking host env vars or secret files",
   "bin": {
-    "claude-box": "bin/claude-box.js"
+    "bagn": "bin/bagn.js"
   },
   "files": [
     "bin",
