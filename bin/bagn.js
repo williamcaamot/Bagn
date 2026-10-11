@@ -50,23 +50,30 @@ const SKIP_DIRS = new Set([
 const HELP = `bagn ${pkg.version}
 Run Claude Code in Docker with only the current folder mounted.
 
-Usage: bagn [box options] [claude args...]
-       bagn [box options] -- [claude args...]
+Usage: bagn [options] [-- args...]
 
-Box options:
-  --box-list        List bagn containers, most recently used first
-  --box-pick        Choose a container to reuse from the list, or start a new one
-  --box-new         Start a new container instead of reusing this folder's
-  --box-shell       Open a bash shell in the container instead of claude
-  --box-cursor      Run the Cursor CLI (cursor-agent) instead of claude
-  --box-sf          Use an image with the Salesforce CLI (sf) installed
-  --box-prune       Remove all stopped bagn containers
-  --box-api-key     Pass ANTHROPIC_API_KEY from your shell into the session
-                    (default: nothing from your environment is passed)
-  --box-rebuild     Rebuild the Docker image (e.g. to update Claude Code)
-  --box-dry-run     Print the docker commands and masked files, don't run
-  --box-force       Allow running in your home directory or /
-  -h, --help        Show this help (also --box-help)
+Options:
+  --yolo        Skip permission prompts (claude --dangerously-skip-permissions,
+                or cursor-agent --yolo with --cursor)
+  --list        List bagn containers, most recently used first
+  --pick        Choose a container to reuse from the list, or start a new one
+  --new         Start a new container instead of reusing this folder's
+  --shell       Open a bash shell in the container instead of claude
+  --cursor      Run the Cursor CLI (cursor-agent) instead of claude
+  --sf          Use an image with the Salesforce CLI (sf) installed
+  --prune       Remove all stopped bagn containers
+  --api-key     Pass ANTHROPIC_API_KEY from your shell into the session
+                (default: nothing from your environment is passed)
+  --rebuild     Rebuild the Docker image (e.g. to update Claude Code)
+  --dry-run     Print the docker commands and masked files, don't run
+  --force       Allow running in your home directory or /
+  -h, --help    Show this help
+
+Everything after -- is passed to claude (or to cursor-agent/bash), e.g.
+  bagn -- -p "summarize this repo"
+  bagn --cursor -- login
+  bagn --shell -- -c "git status"
+Most claude options have an in-session equivalent: /resume, /model, ...
 
 By default the most recent container for the current folder is reused, so
 several terminals in one folder share a container. A container is not reused
@@ -75,42 +82,47 @@ if the image was rebuilt or the set of hidden secret files changed.
 The folder is mounted at the same path inside the container, so Claude Code
 keeps separate sessions and memory for each folder.
 
-Any other arguments are forwarded to claude (or to bash/cursor-agent), e.g.
-  bagn --dangerously-skip-permissions
-Everything after -- is forwarded as is, e.g. claude's own help:
-  bagn -- --help
-
 Secret files (.env, *.pem, ...) are replaced by empty read-only files inside
 the container. Add more patterns in a ${IGNORE_FILE} file; prefix a line
 with ! to un-hide a file.`;
 
+const FLAGS = {
+  '--yolo': 'yolo',
+  '--list': 'list',
+  '--pick': 'pick',
+  '--new': 'new',
+  '--shell': 'shell',
+  '--cursor': 'cursor',
+  '--sf': 'sf',
+  '--prune': 'prune',
+  '--api-key': 'apiKey',
+  '--rebuild': 'rebuild',
+  '--dry-run': 'dryRun',
+  '--force': 'force',
+  '--help': 'help',
+  '-h': 'help',
+};
+
 function parseArgs(argv) {
-  const opts = {
-    apiKey: false, rebuild: false, dryRun: false, force: false, help: false,
-    list: false, pick: false, new: false, shell: false, prune: false, cursor: false, sf: false,
-  };
-  const claudeArgs = [];
+  const opts = Object.fromEntries(Object.values(FLAGS).map((key) => [key, false]));
+  const passArgs = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--') {
-      claudeArgs.push(...argv.slice(i + 1));
+      passArgs.push(...argv.slice(i + 1));
       break;
     }
-    if (arg === '--box-list') opts.list = true;
-    else if (arg === '--box-pick') opts.pick = true;
-    else if (arg === '--box-new') opts.new = true;
-    else if (arg === '--box-shell') opts.shell = true;
-    else if (arg === '--box-cursor') opts.cursor = true;
-    else if (arg === '--box-sf') opts.sf = true;
-    else if (arg === '--box-prune') opts.prune = true;
-    else if (arg === '--box-api-key') opts.apiKey = true;
-    else if (arg === '--box-rebuild') opts.rebuild = true;
-    else if (arg === '--box-dry-run') opts.dryRun = true;
-    else if (arg === '--box-force') opts.force = true;
-    else if (arg === '--box-help' || arg === '--help' || arg === '-h') opts.help = true;
-    else claudeArgs.push(arg);
+    if (FLAGS[arg]) {
+      opts[FLAGS[arg]] = true;
+      continue;
+    }
+    // Options were called --box-<name> before they were shortened.
+    const renamed = arg.startsWith('--box-') && `--${arg.slice(6)}`;
+    if (renamed && FLAGS[renamed]) fail(`${arg} is now ${renamed}`);
+    const what = arg.startsWith('-') ? `unknown option ${arg}` : `unexpected argument "${arg}"`;
+    fail(`${what}. See bagn --help; pass arguments to claude after --`);
   }
-  return { opts, claudeArgs };
+  return { opts, passArgs };
 }
 
 function globToRegExp(glob) {
@@ -211,7 +223,7 @@ function fail(msg) {
 
 function checkFolder(folder, force) {
   if (!force && (folder === path.parse(folder).root || folder === fs.realpathSync(os.homedir()))) {
-    fail(`refusing to mount ${folder} (it would expose everything under it). Use --box-force to override.`);
+    fail(`refusing to mount ${folder} (it would expose everything under it). Use --force to override.`);
   }
   // --mount uses comma-separated fields; fail closed rather than risk a mask
   // silently not applying.
@@ -336,7 +348,7 @@ function prompt(question) {
 }
 
 function pickContainer(containers, cwd) {
-  if (!process.stdin.isTTY) fail('--box-pick needs an interactive terminal');
+  if (!process.stdin.isTTY) fail('--pick needs an interactive terminal');
   if (!containers.length) {
     console.error('bagn: no existing containers, starting a new one');
     return null;
@@ -392,7 +404,7 @@ function execArgs(name, opts, command) {
     if (process.env[envName]) args.push('-e', envName);
   }
   if (opts.apiKey) {
-    if (!process.env.ANTHROPIC_API_KEY) fail('--box-api-key given but ANTHROPIC_API_KEY is not set');
+    if (!process.env.ANTHROPIC_API_KEY) fail('--api-key given but ANTHROPIC_API_KEY is not set');
     args.push('-e', 'ANTHROPIC_API_KEY');
   }
   args.push(name, ...command);
@@ -400,18 +412,19 @@ function execArgs(name, opts, command) {
 }
 
 function main() {
-  const { opts, claudeArgs } = parseArgs(process.argv.slice(2));
+  const { opts, passArgs } = parseArgs(process.argv.slice(2));
   if (opts.help) {
     console.log(HELP);
     return;
   }
 
   const cwd = fs.realpathSync(process.cwd());
-  if (opts.shell && opts.cursor) fail('--box-shell and --box-cursor cannot be combined');
-  let program = 'claude';
-  if (opts.shell) program = 'bash';
-  else if (opts.cursor) program = 'cursor-agent';
-  const command = [program, ...claudeArgs];
+  if (opts.shell && opts.cursor) fail('--shell and --cursor cannot be combined');
+  if (opts.shell && opts.yolo) fail('--yolo applies to claude or --cursor, not --shell');
+  let command = ['claude', ...(opts.yolo ? ['--dangerously-skip-permissions'] : [])];
+  if (opts.shell) command = ['bash'];
+  else if (opts.cursor) command = ['cursor-agent', ...(opts.yolo ? ['--yolo'] : [])];
+  command.push(...passArgs);
 
   if (opts.dryRun) {
     checkFolder(cwd, opts.force);
@@ -455,10 +468,10 @@ function main() {
 
   if (target) {
     if (target.image !== imageId) {
-      fail(`${target.name} uses an older image. Run with --box-new to start a fresh container.`);
+      fail(`${target.name} uses an older image. Run with --new to start a fresh container.`);
     }
     if (target.mounts !== hash) {
-      fail(`${target.name}'s mounts are out of date (secret files in ${folder} changed, or bagn was updated). Run with --box-new from that folder.`);
+      fail(`${target.name}'s mounts are out of date (secret files in ${folder} changed, or bagn was updated). Run with --new from that folder.`);
     }
   } else if (!opts.new) {
     const mine = listContainers().filter((c) => c.folder === folder && c.sf === sf);

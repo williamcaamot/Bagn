@@ -4,13 +4,13 @@ Run Claude Code in a Docker container that can only see the folder you're in.
 
 ```sh
 cd my-project
-npx bagn                                  # interactive Claude Code
-npx bagn --dangerously-skip-permissions   # any claude args are forwarded
-npx bagn --box-shell                      # bash in the container instead of claude
-npx bagn --box-cursor                     # Cursor CLI instead of claude
-npx bagn --box-sf                         # image with the Salesforce CLI too
-npx bagn --help                           # bagn's options
-npx bagn -- --help                        # everything after -- goes to claude as is
+npx bagn                          # interactive Claude Code
+npx bagn --yolo                   # claude --dangerously-skip-permissions
+npx bagn --shell                  # bash in the container instead of claude
+npx bagn --cursor                 # Cursor CLI instead of claude
+npx bagn --sf                     # image with the Salesforce CLI too
+npx bagn --help                   # all options
+npx bagn -- -p "summarize this"   # everything after -- goes to claude as is
 ```
 
 Install locally while developing: `npm link` in this folder, then `bagn` anywhere.
@@ -18,7 +18,7 @@ Install locally while developing: `npm link` in this folder, then `bagn` anywher
 The first run builds the image (`claude-box:<version>`). Run `claude /login` (or
 just start `bagn` and follow the prompt) once; the login is stored in the
 Docker volume `claude-box-config`, not in your host `~/.claude`. Alternatively use
-`--box-api-key` to pass `ANTHROPIC_API_KEY` from your shell.
+`--api-key` to pass `ANTHROPIC_API_KEY` from your shell.
 
 ## Containers
 
@@ -30,18 +30,23 @@ container stops when its last session ends, and the next run starts it again.
 
 | Flag | What it does |
 | --- | --- |
-| `--box-list` | List all bagn containers, most recently used first, with their folder and how many sessions are open |
-| `--box-pick` | Show the same list and type a number to reuse a container (from any folder), or press Enter for a new one |
-| `--box-new` | Start a new container for this folder instead of reusing one |
-| `--box-shell` | Open `bash` in the container instead of `claude`. Combines with `--box-pick`/`--box-new` |
-| `--box-cursor` | Run the Cursor CLI (`cursor-agent`) instead of `claude` |
-| `--box-sf` | Use an image that also has the Salesforce CLI (`sf`). Built on first use |
-| `--box-prune` | Remove all stopped bagn containers |
+| `--yolo` | Skip permission prompts: `claude --dangerously-skip-permissions`, or `cursor-agent --yolo` with `--cursor` |
+| `--list` | List all bagn containers, most recently used first, with their folder and how many sessions are open |
+| `--pick` | Show the same list and type a number to reuse a container (from any folder), or press Enter for a new one |
+| `--new` | Start a new container for this folder instead of reusing one |
+| `--shell` | Open `bash` in the container instead of `claude`. Combines with `--pick`/`--new` |
+| `--cursor` | Run the Cursor CLI (`cursor-agent`) instead of `claude` |
+| `--sf` | Use an image that also has the Salesforce CLI (`sf`). Built on first use |
+| `--prune` | Remove all stopped bagn containers |
 
 A container is only reused if it was built from the current image and the folder's
 hidden secret files are the same as when it was created. The secret mounts can't be
 changed on an existing container. If either has changed, a new container is started and the
-old one is left for `--box-prune`.
+old one is left for `--prune`.
+
+Unknown options are an error. Arguments for `claude` go after `--`, as do arguments for
+`cursor-agent` with `--cursor` and `bash` with `--shell` (`bagn --shell -- -c "git status"`).
+Most claude options can also be set inside a session, e.g. `/resume` and `/model`.
 
 The login volume `claude-box-config` is shared by all containers. The folder is
 mounted at the same path inside the container as on your machine (e.g.
@@ -52,14 +57,14 @@ paths like `/usr`, `/var` or `/tmp` itself are mounted at `/workspace/<name>-<ha
 ## Cursor and Salesforce CLIs
 
 The Cursor CLI (`cursor-agent`, also available as `agent`) is installed in every
-image. Run it with `bagn --box-cursor`, or call it from `--box-shell`/Claude. Log in
-once with `bagn --box-cursor login`. The login is kept in the Docker volume
+image. Run it with `bagn --cursor`, or call it from `--shell`/Claude. Log in
+once with `bagn --cursor -- login`. The login is kept in the Docker volume
 `claude-box-cursor`.
 
 The Salesforce CLI (`sf`) is in a separate image, `claude-box:<version>-sf`, built the
-first time you pass `--box-sf`. Containers made with `--box-sf` are separate from the
-others in the same folder. `--box-pick` reuses a container with whatever it was
-made with. Log in from a `bagn --box-sf --box-shell` session with
+first time you pass `--sf`. Containers made with `--sf` are separate from the
+others in the same folder. `--pick` reuses a container with whatever it was
+made with. Log in from a `bagn --sf --shell` session with
 `sf org login device` (or `sf org login jwt`/`sf org login sfdx-url`). `sf org login web`
 doesn't work, because it waits for a callback on the container's localhost, which your
 browser can't reach. The login is kept in the volume `claude-box-sf`.
@@ -74,13 +79,13 @@ and anything running in the container (including Claude) can read them.
 
 | Risk | How |
 | --- | --- |
-| Shell environment variables | Docker passes none by default. Only `TERM`/`COLORTERM` are forwarded, plus `ANTHROPIC_API_KEY` if you opt in with `--box-api-key`. They're passed per session, so they're never stored in the container's config. |
+| Shell environment variables | Docker passes none by default. Only `TERM`/`COLORTERM` are forwarded, plus `ANTHROPIC_API_KEY` if you opt in with `--api-key`. They're passed per session, so they're never stored in the container's config. |
 | `.env` and other secret files in the folder | Each match is bind-mounted over with `/dev/null` (read-only), so it appears empty. Secret directories (`.aws`, `.ssh`, ...) get an empty read-only tmpfs. The hidden paths are printed at startup. |
-| Files outside the folder | Only the current folder is mounted. Running in `~` or `/` is refused unless you pass `--box-force`. |
+| Files outside the folder | Only the current folder is mounted. Running in `~` or `/` is refused unless you pass `--force`. |
 | Your SSH keys, git credentials, Docker socket, `~/.claude` | Not mounted. |
 | Container escape | All capabilities are dropped, `no-new-privileges` is set, and Claude runs as a non-root user. |
 
-Use `--box-dry-run` to see exactly which files get hidden and the full `docker run`/`docker exec` commands.
+Use `--dry-run` to see exactly which files get hidden and the full `docker run`/`docker exec` commands.
 
 ### Custom patterns
 
@@ -110,6 +115,6 @@ Defaults: `.env`, `.env.*` (except `.env.example`/`.sample`/`.template`), `.envr
 
 - `node_modules`, `.git`, `dist`, `.next` and similar folders are not scanned.
 - Only the current folder is mounted. If you start inside a monorepo subfolder, the repo root isn't visible.
-- Update Claude Code and Cursor with `bagn --box-rebuild` (add `--box-sf` to rebuild the Salesforce image). It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
-- Containers keep their own filesystem changes (e.g. tools installed in `~`) between sessions. Use `--box-new` for a clean one.
+- Update Claude Code and Cursor with `bagn --rebuild` (add `--sf` to rebuild the Salesforce image). It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
+- Containers keep their own filesystem changes (e.g. tools installed in `~`) between sessions. Use `--new` for a clean one.
 - Background processes started in a session are stopped when the container's last session ends.
