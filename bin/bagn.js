@@ -589,6 +589,19 @@ function importSfOrg(name, org) {
   return sfMessage(msg) || 'sf org login failed';
 }
 
+// Cursor chmods its config folders, which only their owner may do. The
+// volume's folders start out owned by root (and on Linux the container runs
+// as the host uid), so hand them to the container user. This runs as root in
+// a throwaway container, since bagn's containers have no capabilities.
+function cursorVolumeArgs(image) {
+  const owner = process.platform === 'linux' && process.getuid ? `${process.getuid()}:${process.getgid()}` : 'node:node';
+  return [
+    'run', '--rm', '--user', 'root', '--network', 'none',
+    '--mount', `type=volume,source=${CURSOR_VOLUME},target=/cursor-config`,
+    image, 'chown', '-R', owner, '/cursor-config',
+  ];
+}
+
 function stopIfIdle(name) {
   if (sessionCount(name) === 0) docker(['stop', '-t', '2', name], 'ignore');
 }
@@ -618,6 +631,7 @@ function main() {
       const args = importArgs(name, { alias: org });
       console.log(`${['docker', ...args].map(shellQuote).join(' ')} < (sfdxAuthUrl from: sf org display -o ${shellQuote(org)} --verbose)`);
     }
+    if (opts.cursor) console.log(['docker', ...cursorVolumeArgs(opts.sf ? SF_IMAGE : IMAGE)].map(shellQuote).join(' '));
     console.log(['docker', ...execArgs(name, opts, command)].map(shellQuote).join(' '));
     return;
   }
@@ -696,6 +710,10 @@ function main() {
       fail(`could not link org ${org.org}: ${err}`);
     }
     console.error(`bagn: linked org ${org.alias || org.org}`);
+  }
+
+  if (opts.cursor && docker(cursorVolumeArgs(image), 'ignore').status !== 0) {
+    console.error(`bagn: could not set ownership of the ${CURSOR_VOLUME} volume; cursor-agent login may fail`);
   }
 
   const res = docker(execArgs(name, opts, command));

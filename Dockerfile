@@ -23,9 +23,11 @@ RUN mkdir -p /claude-config /workspace \
  && chmod 777 /claude-config /workspace /home/node
 
 # Cursor keeps settings in ~/.cursor and its login in ~/.config/cursor. Both
-# point into /cursor-config, a named volume shared by all containers.
+# point into /cursor-config, a named volume shared by all containers. Owned by
+# node because Cursor chmods them, which only the owner may do.
 RUN mkdir -p /cursor-config/home /cursor-config/config /home/node/.config \
  && chmod -R 777 /cursor-config /home/node/.config \
+ && chown -R node:node /cursor-config \
  && ln -s /cursor-config/home /home/node/.cursor \
  && ln -s /cursor-config/config /home/node/.config/cursor
 
