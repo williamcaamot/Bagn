@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const tty = require('node:tty');
 
 const pkg = require('../package.json');
 
@@ -56,8 +57,9 @@ Options:
   --yolo        Skip permission prompts (claude --dangerously-skip-permissions,
                 or cursor-agent --yolo with --cursor)
   --list        List bagn containers, most recently used first
-  --pick        Choose a container to reuse from the list, or start a new one
-  --new         Start a new container instead of reusing this folder's
+  --pick        Choose any container to reuse (from any folder), or start a
+                new one
+  --new         Start a new container without asking
   --shell       Open a bash shell in the container instead of claude
   --cursor      Run the Cursor CLI (cursor-agent) instead of claude
   --sf          Use an image with the Salesforce CLI (sf) installed
@@ -79,8 +81,9 @@ Everything after -- is passed to claude (or to cursor-agent/bash), e.g.
   bagn --shell -- -c "git status"
 Most claude options have an in-session equivalent: /resume, /model, ...
 
-By default the most recent container for the current folder is reused, so
-several terminals in one folder share a container. A container is not reused
+If the current folder has containers, you choose one with the arrow keys
+and Enter, or start a new one; several terminals in one folder can share a
+container. Without a terminal, the most recent one is reused. A container is not reused
 if the image was rebuilt or the set of hidden secret files changed.
 
 The folder is mounted at the same path inside the container, so Claude Code
@@ -331,22 +334,37 @@ function ago(ms) {
   return `${Math.floor(mins / (60 * 24))}d ago`;
 }
 
-function printContainers(containers, cwd) {
-  const rows = [['#', 'NAME', 'STATUS', 'FOLDER']];
-  containers.forEach((c, i) => {
-    let status = `last used ${ago(c.lastUsed)}`;
-    if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
-    if (c.sf) status += ', sf';
-    rows.push([String(i + 1), c.name, status, c.folder === cwd ? `${c.folder} (here)` : c.folder]);
-  });
-  const widths = rows[0].map((_, col) => Math.max(...rows.map((r) => r[col].length)));
-  for (const row of rows) {
-    console.error(row.map((cell, col) => (col === row.length - 1 ? cell : cell.padEnd(widths[col]))).join('  '));
-  }
+function statusText(c) {
+  let status = `last used ${ago(c.lastUsed)}`;
+  if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
+  if (c.sf) status += ', sf';
+  return status;
 }
 
-// Reads a line from the terminal without opening stdin as a stream, which
-// would change its mode under the docker exec that follows.
+// Pads every column but the last to a common width.
+function formatTable(rows) {
+  const widths = rows[0].map((_, col) => Math.max(...rows.map((r) => r[col].length)));
+  return rows.map((row) => row.map((cell, col) => (col === row.length - 1 ? cell : cell.padEnd(widths[col]))).join('  '));
+}
+
+function folderText(c, cwd) {
+  return c.folder === cwd ? `${c.folder} (here)` : c.folder;
+}
+
+function printContainers(containers, cwd) {
+  const rows = [['#', 'NAME', 'STATUS', 'FOLDER']];
+  containers.forEach((c, i) => rows.push([String(i + 1), c.name, statusText(c), folderText(c, cwd)]));
+  for (const line of formatTable(rows)) console.error(line);
+}
+
+// Checks for a terminal without touching process.stdin: creating that stream
+// makes stdin non-blocking, which breaks the reads below and changes its mode
+// under the docker exec that follows.
+function interactive() {
+  return tty.isatty(0) && tty.isatty(2);
+}
+
+// Reads a line from the terminal without opening stdin as a stream.
 function prompt(question) {
   process.stderr.write(question);
   const buf = Buffer.alloc(1024);
@@ -359,18 +377,104 @@ function prompt(question) {
   return buf.toString('utf8', 0, n).trim();
 }
 
+// Runs fn with the terminal sending keys as they are pressed, unechoed, and
+// Ctrl-C as a key. Returns undefined if stty is unavailable (e.g. Windows).
+function withRawTerminal(fn) {
+  const stty = (...args) => spawnSync('stty', args, { stdio: ['inherit', 'pipe', 'ignore'], encoding: 'utf8' });
+  const saved = stty('-g');
+  if (saved.status !== 0) return undefined;
+  stty('-icanon', '-echo', '-isig', 'min', '1', 'time', '0');
+  try {
+    return fn();
+  } finally {
+    stty(saved.stdout.trim());
+  }
+}
+
+function readKeys() {
+  const buf = Buffer.alloc(64);
+  let n = 0;
+  try {
+    n = fs.readSync(0, buf, 0, buf.length, null);
+  } catch {
+    // Treated like end of input.
+  }
+  if (!n) return ['\x04'];
+  return buf.toString('utf8', 0, n).match(/\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|[\s\S]/g);
+}
+
+// Shows items with an arrow-key cursor. Returns the chosen index, or -1 if
+// cancelled.
+function menu(title, items) {
+  const out = process.stderr;
+  const fit = (s) => {
+    const max = (out.columns || 80) - 3;
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  };
+  let sel = 0;
+  let drawn = 0;
+  const clear = () => out.write(`${drawn ? `\x1b[${drawn}A` : ''}\r\x1b[J`);
+  const draw = () => {
+    clear();
+    const lines = [
+      fit(title),
+      ...items.map((item, i) => (i === sel ? `\x1b[36m❯ ${fit(item)}\x1b[0m` : `  ${fit(item)}`)),
+      '\x1b[2m↑/↓ to move, Enter to select, Esc to cancel\x1b[0m',
+    ];
+    out.write(`${lines.join('\n')}\n`);
+    drawn = lines.length;
+  };
+  out.write('\x1b[?25l');
+  try {
+    draw();
+    for (;;) {
+      for (const key of readKeys()) {
+        if (['\x1b[A', '\x1bOA', 'k'].includes(key)) sel = (sel + items.length - 1) % items.length;
+        else if (['\x1b[B', '\x1bOB', 'j'].includes(key)) sel = (sel + 1) % items.length;
+        else if (/^[1-9]$/.test(key) && Number(key) <= items.length) sel = Number(key) - 1;
+        else if (key === '\r' || key === '\n') {
+          clear();
+          out.write(`${fit(title)} \x1b[36m${fit(items[sel].trim())}\x1b[0m\n`);
+          return sel;
+        } else if (['\x03', '\x04', '\x1b', 'q'].includes(key)) {
+          clear();
+          return -1;
+        }
+      }
+      draw();
+    }
+  } finally {
+    out.write('\x1b[?25h');
+  }
+}
+
+// Lets the user pick one of containers, or null for a new container.
+function chooseContainer(containers, cwd, title) {
+  const showFolders = containers.some((c) => c.folder !== cwd);
+  const rows = formatTable(containers.map((c) => [c.name, statusText(c), ...(showFolders ? [folderText(c, cwd)] : [])]));
+  const items = [...rows, '+ Start a new container'];
+  let choice = withRawTerminal(() => menu(title, items));
+  if (choice === undefined) {
+    printContainers(containers, cwd);
+    const answer = prompt('\nContainer # to reuse, or Enter for a new one: ');
+    if (!answer || answer.toLowerCase() === 'n') return null;
+    choice = /^\d+$/.test(answer) ? Number(answer) - 1 : -2;
+    if (!containers[choice]) fail(`no container #${answer}`);
+  }
+  if (choice === -1) {
+    console.error('bagn: cancelled');
+    process.exit(130);
+  }
+  return containers[choice] || null;
+}
+
 function pickContainer(containers, cwd) {
-  if (!process.stdin.isTTY) fail('--pick needs an interactive terminal');
+  if (!interactive()) fail('--pick needs an interactive terminal');
   if (!containers.length) {
     console.error('bagn: no existing containers, starting a new one');
     return null;
   }
-  printContainers(containers, cwd);
-  const answer = prompt('\nContainer # to reuse, or Enter for a new one: ');
-  if (!answer || answer.toLowerCase() === 'n') return null;
-  const picked = /^\d+$/.test(answer) && containers[Number(answer) - 1];
-  if (!picked) fail(`no container #${answer}`);
-  return picked;
+  return chooseContainer(containers, cwd, 'Pick a container:');
 }
 
 function createArgs(name, folder, secrets, sf) {
@@ -408,7 +512,7 @@ function createArgs(name, folder, secrets, sf) {
 }
 
 function execArgs(name, opts, command) {
-  const args = ['exec', process.stdin.isTTY && process.stdout.isTTY ? '-it' : '-i'];
+  const args = ['exec', tty.isatty(0) && tty.isatty(1) ? '-it' : '-i'];
   // Docker passes no host environment by default. Only these are added, per
   // session so they're never stored in the container's config, and -e NAME
   // (without =value) keeps values out of the process list.
@@ -561,9 +665,15 @@ function main() {
     }
   } else if (!opts.new) {
     const mine = listContainers().filter((c) => c.folder === folder && c.sf === sf);
-    target = mine.find((c) => c.image === imageId && c.mounts === hash) || null;
-    if (!target && mine.length) {
+    const usable = mine.filter((c) => c.image === imageId && c.mounts === hash);
+    if (!usable.length && mine.length) {
       console.error("bagn: this folder's containers are out of date (image rebuilt, secret files changed, or bagn updated)");
+    }
+    if (usable.length && interactive()) {
+      for (const c of usable) c.sessions = c.running ? sessionCount(c.name) : 0;
+      target = chooseContainer(usable, cwd, `Containers for ${folder}:`);
+    } else {
+      target = usable[0] || null;
     }
   }
 

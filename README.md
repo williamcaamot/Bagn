@@ -23,8 +23,10 @@ Docker volume `claude-box-config`, not in your host `~/.claude`. Alternatively u
 
 ## Containers
 
-Each folder gets its own container. Running `bagn` again in the same folder
-reuses that container, and starts it again if it's stopped. Each `bagn` call is a separate session
+Each folder gets its own container. Running `bagn` again in a folder that already
+has containers lists them: pick one with ↑/↓ and Enter (the most recently used is
+selected), or choose "Start a new container". A stopped container is started again.
+Without an interactive terminal the most recent one is reused. Each `bagn` call is a separate session
 (`docker exec`), so you can have several terminals open on one folder at once,
 and they share the same container. Different folders get separate containers. The
 container stops when its last session ends, and the next run starts it again.
@@ -33,8 +35,8 @@ container stops when its last session ends, and the next run starts it again.
 | --- | --- |
 | `--yolo` | Skip permission prompts: `claude --dangerously-skip-permissions`, or `cursor-agent --yolo` with `--cursor` |
 | `--list` | List all bagn containers, most recently used first, with their folder and how many sessions are open |
-| `--pick` | Show the same list and type a number to reuse a container (from any folder), or press Enter for a new one |
-| `--new` | Start a new container for this folder instead of reusing one |
+| `--pick` | Pick from all containers, from any folder, with ↑/↓ and Enter, or start a new one |
+| `--new` | Start a new container for this folder without asking |
 | `--shell` | Open `bash` in the container instead of `claude`. Combines with `--pick`/`--new` |
 | `--cursor` | Run the Cursor CLI (`cursor-agent`) instead of `claude` |
 | `--sf` | Use an image that also has the Salesforce CLI (`sf`). Built on first use |
