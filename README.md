@@ -1,6 +1,7 @@
 # bagn
 
-Run Claude Code in a Docker container that can only see the folder you're in.
+Run Claude Code or the Cursor CLI in a Docker container that can only see the folder you're in.
+Every image comes with Claude Code, the Cursor CLI and the Salesforce CLI preinstalled.
 
 ```sh
 cd my-project
@@ -8,22 +9,26 @@ npx bagn                          # interactive Claude Code
 npx bagn --yolo                   # claude --dangerously-skip-permissions
 npx bagn --shell                  # bash in the container instead of claude
 npx bagn --cursor                 # Cursor CLI instead of claude
-npx bagn --sf                     # image with the Salesforce CLI too
-npx bagn --sf-org myscratch       # ...and copy an org's login from your sf
+npx bagn --sf-org myscratch       # copy an org's login from your sf
 npx bagn --help                   # all options
 npx bagn -- -p "summarize this"   # everything after -- goes to claude as is
 ```
 
+The first run asks whether bagn should start Claude Code or the Cursor CLI by default, and
+saves the answer in `~/.config/bagn/config.json` (delete it to be asked again).
+`--claude` and `--cursor` override it for one run.
+
 Install locally while developing: `npm link` in this folder, then `bagn` anywhere.
 
-The first run builds the image (`claude-box:<version>`). Run `claude /login` (or
+The first run builds the image (`bagn:<version>`). Run `claude /login` (or
 just start `bagn` and follow the prompt) once; the login is stored in the
-Docker volume `claude-box-config`, not in your host `~/.claude`. Alternatively use
+Docker volume `bagn-claude`, not in your host `~/.claude`. Alternatively use
 `--api-key` to pass `ANTHROPIC_API_KEY` from your shell.
 
 ## Containers
 
-Each folder gets its own container. Running `bagn` again in a folder that already
+Each folder gets its own container. New containers are named after the folder plus two
+random words, e.g. `my-project-brave-otter`, so they're easy to recognize when you pick one again. Running `bagn` again in a folder that already
 has containers lists them: pick one with ↑/↓ and Enter (the most recently used is
 selected), or choose "Start a new container". A stopped container is started again.
 Without an interactive terminal the most recent one is reused. Each `bagn` call is a separate session
@@ -33,14 +38,16 @@ container stops when its last session ends, and the next run starts it again.
 
 | Flag | What it does |
 | --- | --- |
-| `--yolo` | Skip permission prompts: `claude --dangerously-skip-permissions`, or `cursor-agent --yolo` with `--cursor` |
+| `--yolo` | Skip permission prompts: `claude --dangerously-skip-permissions`, or `cursor-agent --yolo` |
 | `--list` | List all bagn containers, most recently used first, with their folder and how many sessions are open |
 | `--pick` | Pick from all containers, from any folder, with ↑/↓ and Enter, or start a new one |
 | `--new` | Start a new container for this folder without asking |
 | `--shell` | Open `bash` in the container instead of `claude`. Combines with `--pick`/`--new` |
-| `--cursor` | Run the Cursor CLI (`cursor-agent`) instead of `claude` |
-| `--sf` | Use an image that also has the Salesforce CLI (`sf`). Built on first use |
-| `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the containers' `sf`, keeping its alias. Repeatable. Implies `--sf` |
+| `--claude` | Run Claude Code this time, whatever the default is |
+| `--cursor` | Run the Cursor CLI (`cursor-agent`) this time, whatever the default is |
+| `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the containers' `sf`, keeping its alias. Repeatable |
+| `--no-org` | Don't ask for a scratch org when starting a new container |
+| `--link-org` | Pick a container, then one of the scratch orgs from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
 | `--prune` | Remove all stopped bagn containers |
 
 A container is only reused if it was built from the current image and the folder's
@@ -52,7 +59,7 @@ Unknown options are an error. Arguments for `claude` go after `--`, as do argume
 `cursor-agent` with `--cursor` and `bash` with `--shell` (`bagn --shell -- -c "git status"`).
 Most claude options can also be set inside a session, e.g. `/resume` and `/model`.
 
-The login volume `claude-box-config` is shared by all containers. The folder is
+The Claude login volume `bagn-claude` is shared by all containers. The folder is
 mounted at the same path inside the container as on your machine (e.g.
 `/Users/you/project`), so Claude Code keeps separate sessions, `--resume` history and
 memory for each folder, and the paths it prints match yours. Folders under system
@@ -61,16 +68,20 @@ paths like `/usr`, `/var` or `/tmp` itself are mounted at `/workspace/<name>-<ha
 ## Cursor and Salesforce CLIs
 
 The Cursor CLI (`cursor-agent`, also available as `agent`) is installed in every
-image. Run it with `bagn --cursor`, or call it from `--shell`/Claude. Log in
+image. Run it with `bagn --cursor` (or make it the default on the first run), or call it from `--shell`/Claude. Log in
 once with `bagn --cursor -- login`. The login is kept in the Docker volume
-`claude-box-cursor`.
+`bagn-cursor`.
 
-The Salesforce CLI (`sf`) is in a separate image, `claude-box:<version>-sf`, built the
-first time you pass `--sf`. Containers made with `--sf` are separate from the
-others in the same folder. `--pick` reuses a container with whatever it was
-made with. Logins are kept in the volume `claude-box-sf`, so every `--sf` container has them.
+The Salesforce CLI (`sf`) is also installed in every image. Its logins are kept in the
+volume `bagn-sf`, so every container has them. (`--sf` is no longer needed and is ignored.)
 
-To use an org you're already logged in to on your computer (e.g. a scratch org), copy its
+When bagn starts a new container in an interactive terminal, it lists the active scratch
+orgs from `sf` on your computer. Pick one (or "None") and its login is copied into the
+container, and it becomes that container's default org (`SF_TARGET_ORG`, shown in
+the container list), so each container can work against its own scratch org. This is
+skipped with `--sf-org` or `--no-org`, or if `sf` isn't installed on your computer.
+
+To use any other org you're already logged in to on your computer (e.g. a scratch org), copy its
 login in:
 
 ```sh
@@ -88,11 +99,13 @@ JWT-authorized Dev Hub, can't be copied. Mounting your `~/.sfdx` wouldn't work e
 macOS those tokens are encrypted with a key in your Keychain.
 
 To log in from inside the container instead, use `sf org login device` (or
-`sf org login jwt`) in a `bagn --sf --shell` session. `sf org login web` doesn't work, because
+`sf org login jwt`) in a `bagn --shell` session. `sf org login web` doesn't work, because
 it waits for a callback on the container's localhost, which your browser can't reach.
 
-The Docker image and volume names still start with `claude-box`, so logins and
-containers from before the rename carry over.
+bagn used to be called claude-box. The first run copies the old `claude-box-*` volumes
+into the new `bagn-*` ones, so you stay logged in, and a `.claudeboxignore` file is
+still read. Old containers aren't reused. `--prune` removes the stopped ones, and you
+can delete the old volumes with `docker volume rm claude-box-config claude-box-cursor claude-box-sf`.
 
 Like the Claude login, these logins are shared by every container and folder,
 and anything running in the container (including Claude) can read them.
@@ -111,7 +124,7 @@ Use `--dry-run` to see exactly which files get hidden and the full `docker run`/
 
 ### Custom patterns
 
-Create a `.claudeboxignore` file in the folder:
+Create a `.bagnignore` file in the folder:
 
 ```
 # hide these too
@@ -137,6 +150,6 @@ Defaults: `.env`, `.env.*` (except `.env.example`/`.sample`/`.template`), `.envr
 
 - `node_modules`, `.git`, `dist`, `.next` and similar folders are not scanned.
 - Only the current folder is mounted. If you start inside a monorepo subfolder, the repo root isn't visible.
-- Update Claude Code and Cursor with `bagn --rebuild` (add `--sf` to rebuild the Salesforce image). It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
+- Update Claude Code, Cursor and the Salesforce CLI with `bagn --rebuild`. It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
 - Containers keep their own filesystem changes (e.g. tools installed in `~`) between sessions. Use `--new` for a clean one.
 - Background processes started in a session are stopped when the container's last session ends.

@@ -31,17 +31,13 @@ RUN mkdir -p /cursor-config/home /cursor-config/config /home/node/.config \
  && ln -s /cursor-config/home /home/node/.cursor \
  && ln -s /cursor-config/config /home/node/.config/cursor
 
-# Salesforce CLI, only in the image built for --box-sf. Its login (~/.sf,
-# ~/.sfdx) lives in the /sf-config volume. Declared late so both images share
-# the layers above.
-ARG INSTALL_SF=0
-RUN if [ "$INSTALL_SF" = 1 ]; then \
-      npm install -g @salesforce/cli \
-      && mkdir -p /sf-config/sf /sf-config/sfdx \
-      && chmod -R 777 /sf-config \
-      && ln -s /sf-config/sf /home/node/.sf \
-      && ln -s /sf-config/sfdx /home/node/.sfdx; \
-    fi
+# Salesforce CLI. Its login (~/.sf, ~/.sfdx) lives in the /sf-config volume,
+# shared by all containers.
+RUN npm install -g @salesforce/cli \
+ && mkdir -p /sf-config/sf /sf-config/sfdx \
+ && chmod -R 777 /sf-config \
+ && ln -s /sf-config/sf /home/node/.sf \
+ && ln -s /sf-config/sfdx /home/node/.sfdx
 
 ENV HOME=/home/node \
     CLAUDE_CONFIG_DIR=/claude-config \

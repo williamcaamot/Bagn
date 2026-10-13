@@ -1,7 +1,7 @@
 {
   "name": "bagn",
-  "version": "0.2.0",
-  "description": "Run Claude Code in a Docker container scoped to the current folder, without leaking host env vars or secret files",
+  "version": "0.3.0",
+  "description": "Run Claude Code or the Cursor CLI in a Docker container scoped to the current folder, without leaking host env vars or secret files",
   "bin": {
     "bagn": "bin/bagn.js"
   },
@@ -12,6 +12,6 @@
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["claude", "claude-code", "docker", "sandbox"],
+  "keywords": ["claude", "claude-code", "cursor", "salesforce", "docker", "sandbox"],
   "license": "MIT"
 }

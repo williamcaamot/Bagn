@@ -10,17 +10,46 @@ const tty = require('node:tty');
 
 const pkg = require('../package.json');
 
-// Docker images, volumes and labels keep the original claude-box names so
-// existing logins and containers carry over.
-const IMAGE = `claude-box:${pkg.version}`;
-const SF_IMAGE = `claude-box:${pkg.version}-sf`;
-const CONFIG_VOLUME = 'claude-box-config';
-const CURSOR_VOLUME = 'claude-box-cursor';
-const SF_VOLUME = 'claude-box-sf';
-const IGNORE_FILE = '.claudeboxignore';
-const LABEL_FOLDER = 'claude-box.folder';
-const LABEL_MOUNTS = 'claude-box.mounts';
-const LABEL_SF = 'claude-box.sf';
+const IMAGE = `bagn:${pkg.version}`;
+const CONFIG_VOLUME = 'bagn-claude';
+const CURSOR_VOLUME = 'bagn-cursor';
+const SF_VOLUME = 'bagn-sf';
+const IGNORE_FILE = '.bagnignore';
+const LABEL_FOLDER = 'bagn.folder';
+const LABEL_MOUNTS = 'bagn.mounts';
+const LABEL_SF = 'bagn.sf';
+const LABEL_ORG = 'bagn.org';
+
+// Settings kept on this computer, e.g. { "agent": "cursor" }.
+const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'bagn', 'config.json');
+
+// bagn was called claude-box. Its ignore file is still read, its volumes
+// (with the logins) are copied into the new ones once, and --prune removes
+// its stopped containers.
+const LEGACY_IGNORE_FILE = '.claudeboxignore';
+const LEGACY_VOLUMES = [
+  ['claude-box-config', CONFIG_VOLUME],
+  ['claude-box-cursor', CURSOR_VOLUME],
+  ['claude-box-sf', SF_VOLUME],
+];
+const LEGACY_LABEL_FOLDER = 'claude-box.folder';
+
+// Container names are the folder name plus two of these, like
+// my-project-brave-otter, so they're easy to tell apart and pick again.
+const ADJECTIVES = [
+  'amber', 'bold', 'brave', 'brisk', 'calm', 'clever', 'cosmic', 'crisp', 'dapper', 'eager',
+  'fancy', 'fierce', 'gentle', 'glad', 'golden', 'happy', 'hidden', 'humble', 'jolly', 'keen',
+  'lively', 'lucky', 'mellow', 'mighty', 'misty', 'nimble', 'noble', 'quiet', 'rapid', 'rustic',
+  'shiny', 'silent', 'silver', 'sleepy', 'snowy', 'solar', 'spicy', 'steady', 'sunny', 'swift',
+  'tidy', 'tiny', 'vivid', 'warm', 'wild', 'wise', 'witty', 'zesty',
+];
+const NOUNS = [
+  'badger', 'beacon', 'birch', 'brook', 'canyon', 'cedar', 'comet', 'coral', 'crane', 'dune',
+  'falcon', 'fern', 'fjord', 'fox', 'glacier', 'harbor', 'hawk', 'heron', 'island', 'lagoon',
+  'lantern', 'lynx', 'maple', 'meadow', 'moose', 'nebula', 'oak', 'orca', 'otter', 'owl',
+  'panda', 'pebble', 'pine', 'puffin', 'raven', 'reef', 'river', 'robin', 'salmon', 'spruce',
+  'summit', 'tiger', 'tundra', 'valley', 'walrus', 'willow', 'wolf', 'zephyr',
+];
 
 // Folders are mounted at their host path, except where that would shadow the
 // image's own directories or sit somewhere the container user can't reach.
@@ -49,24 +78,29 @@ const SKIP_DIRS = new Set([
 ]);
 
 const HELP = `bagn ${pkg.version}
-Run Claude Code in Docker with only the current folder mounted.
+Run Claude Code or the Cursor CLI in Docker with only the current folder
+mounted.
 
 Usage: bagn [options] [-- args...]
 
 Options:
   --yolo        Skip permission prompts (claude --dangerously-skip-permissions,
-                or cursor-agent --yolo with --cursor)
+                or cursor-agent --yolo)
   --list        List bagn containers, most recently used first
   --pick        Choose any container to reuse (from any folder), or start a
                 new one
   --new         Start a new container without asking
   --shell       Open a bash shell in the container instead of claude
-  --cursor      Run the Cursor CLI (cursor-agent) instead of claude
-  --sf          Use an image with the Salesforce CLI (sf) installed
+  --claude      Run Claude Code this time, whatever the default is
+  --cursor      Run the Cursor CLI (cursor-agent) this time, whatever the
+                default is
   --sf-org <org>
                 Copy the login for an org (alias or username) from sf on this
                 computer into the containers' sf, keeping its alias. Repeat
-                for more orgs. Implies --sf
+                for more orgs
+  --no-org      Don't ask for a scratch org when starting a new container
+  --link-org    Choose a container and a scratch org from sf on this
+                computer, and copy the org's login into the container
   --prune       Remove all stopped bagn containers
   --api-key     Pass ANTHROPIC_API_KEY from your shell into the session
                 (default: nothing from your environment is passed)
@@ -86,6 +120,14 @@ and Enter, or start a new one; several terminals in one folder can share a
 container. Without a terminal, the most recent one is reused. A container is not reused
 if the image was rebuilt or the set of hidden secret files changed.
 
+The first run asks whether to start Claude Code or the Cursor CLI by default.
+The answer is saved in ${CONFIG_FILE.replace(os.homedir(), '~')}; delete it to be
+asked again.
+
+Every container has the Salesforce CLI (sf). When a new container starts,
+you can pick one of the scratch orgs from sf on this computer: its login is
+copied in and it becomes the container's default org (SF_TARGET_ORG).
+
 The folder is mounted at the same path inside the container, so Claude Code
 keeps separate sessions and memory for each folder.
 
@@ -99,9 +141,12 @@ const FLAGS = {
   '--pick': 'pick',
   '--new': 'new',
   '--shell': 'shell',
+  '--claude': 'claude',
   '--cursor': 'cursor',
   '--sf': 'sf',
+  '--no-org': 'noOrg',
   '--prune': 'prune',
+  '--link-org': 'linkOrg',
   '--api-key': 'apiKey',
   '--rebuild': 'rebuild',
   '--dry-run': 'dryRun',
@@ -128,7 +173,6 @@ function parseArgs(argv) {
       const value = arg === '--sf-org' ? argv[++i] : arg.slice('--sf-org='.length);
       if (!value || value.startsWith('-')) fail('--sf-org needs an org alias or username');
       opts.sfOrgs.push(value);
-      opts.sf = true;
       continue;
     }
     // Options were called --box-<name> before they were shortened.
@@ -165,8 +209,9 @@ function matches(compiled, relPath) {
 function loadPatterns(root) {
   const masks = [...DEFAULT_MASKS];
   const allow = [...DEFAULT_ALLOW];
-  const file = path.join(root, IGNORE_FILE);
-  if (fs.existsSync(file)) {
+  for (const name of [IGNORE_FILE, LEGACY_IGNORE_FILE]) {
+    const file = path.join(root, name);
+    if (!fs.existsSync(file)) continue;
     for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
       const line = raw.trim();
       if (!line || line.startsWith('#')) continue;
@@ -216,14 +261,13 @@ function dockerOut(args) {
   return res.status === 0 ? res.stdout.trim() : null;
 }
 
-function ensureImage(image, sf, rebuild) {
+function ensureImage(image, rebuild) {
   if (!rebuild && docker(['image', 'inspect', image], 'ignore').status === 0) return;
   console.error(`bagn: building ${image}...`);
   // On rebuild, skip the layer cache, which would otherwise keep the old
   // Claude Code install, and pull the latest base image.
   const cacheArgs = rebuild ? ['--pull', '--no-cache'] : [];
-  const sfArgs = sf ? ['--build-arg', 'INSTALL_SF=1'] : [];
-  const res = docker(['build', ...cacheArgs, ...sfArgs, '-t', image, path.join(__dirname, '..')]);
+  const res = docker(['build', ...cacheArgs, '-t', image, path.join(__dirname, '..')]);
   if (res.status !== 0) fail('docker build failed');
 }
 
@@ -271,8 +315,18 @@ function slug(folder) {
     .replace(/[^a-z0-9_.-]+/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 30) || 'folder';
 }
 
+function pickWord(words) {
+  return words[crypto.randomInt(words.length)];
+}
+
+// Docker container names are global, so retry until one is free.
 function containerName(folder) {
-  return `bagn-${slug(folder)}-${crypto.randomBytes(3).toString('hex')}`;
+  const taken = new Set((dockerOut(['ps', '-a', '--format', '{{.Names}}']) || '').split('\n'));
+  for (let i = 0; i < 20; i++) {
+    const name = `${slug(folder)}-${pickWord(ADJECTIVES)}-${pickWord(NOUNS)}`;
+    if (!taken.has(name)) return name;
+  }
+  return `${slug(folder)}-${pickWord(ADJECTIVES)}-${crypto.randomBytes(3).toString('hex')}`;
 }
 
 // Claude Code keys sessions and memory by working directory, so mounting
@@ -320,6 +374,7 @@ function listContainers({ sessions = false } = {}) {
       mounts: c.Config.Labels[LABEL_MOUNTS],
       image: c.Image,
       sf: c.Config.Labels[LABEL_SF] === '1',
+      org: c.Config.Labels[LABEL_ORG] || null,
       sessions: sessions && running ? sessionCount(name) : 0,
     };
   });
@@ -337,7 +392,7 @@ function ago(ms) {
 function statusText(c) {
   let status = `last used ${ago(c.lastUsed)}`;
   if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
-  if (c.sf) status += ', sf';
+  if (c.org) status += `, org ${c.org}`;
   return status;
 }
 
@@ -362,6 +417,35 @@ function printContainers(containers, cwd) {
 // under the docker exec that follows.
 function interactive() {
   return tty.isatty(0) && tty.isatty(2);
+}
+
+function readConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+// Returns the saved default agent ('claude' or 'cursor'). If there is none
+// yet, asks for one and saves it, when ask is set and there is a terminal;
+// otherwise it's claude.
+function defaultAgent(ask) {
+  const config = readConfig();
+  if (config.agent === 'claude' || config.agent === 'cursor') return config.agent;
+  if (!ask || !interactive()) return 'claude';
+  const agents = ['claude', 'cursor'];
+  const agent = agents[select('Which agent should bagn start by default?', [
+    'Claude Code', 'Cursor CLI (cursor-agent)',
+  ])];
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, `${JSON.stringify({ ...config, agent }, null, 2)}\n`);
+    console.error(`bagn: saved in ${CONFIG_FILE}. Use --claude or --cursor to run the other one.`);
+  } catch (err) {
+    console.error(`bagn: could not save ${CONFIG_FILE} (${err.message}); you'll be asked again next time`);
+  }
+  return agent;
 }
 
 // Reads a line from the terminal without opening stdin as a stream.
@@ -449,22 +533,32 @@ function menu(title, items) {
 }
 
 // Lets the user pick one of containers, or null for a new container.
-function chooseContainer(containers, cwd, title) {
-  const showFolders = containers.some((c) => c.folder !== cwd);
-  const rows = formatTable(containers.map((c) => [c.name, statusText(c), ...(showFolders ? [folderText(c, cwd)] : [])]));
-  const items = [...rows, '+ Start a new container'];
+// Shows items as an arrow-key menu, or a numbered list where that isn't
+// possible, and returns the chosen index. Exits if the user cancels.
+function select(title, items) {
   let choice = withRawTerminal(() => menu(title, items));
   if (choice === undefined) {
-    printContainers(containers, cwd);
-    const answer = prompt('\nContainer # to reuse, or Enter for a new one: ');
-    if (!answer || answer.toLowerCase() === 'n') return null;
-    choice = /^\d+$/.test(answer) ? Number(answer) - 1 : -2;
-    if (!containers[choice]) fail(`no container #${answer}`);
+    console.error(title);
+    items.forEach((item, i) => console.error(`  ${i + 1}) ${item}`));
+    const answer = prompt('# ');
+    choice = /^\d+$/.test(answer) && items[Number(answer) - 1] !== undefined ? Number(answer) - 1 : -1;
+    if (choice === -1 && answer) fail(`no choice #${answer}`);
   }
   if (choice === -1) {
     console.error('bagn: cancelled');
     process.exit(130);
   }
+  return choice;
+}
+
+function containerItems(containers, cwd) {
+  const showFolders = containers.some((c) => c.folder !== cwd);
+  return formatTable(containers.map((c) => [c.name, statusText(c), ...(showFolders ? [folderText(c, cwd)] : [])]));
+}
+
+// Lets the user pick one of containers, or null for a new container.
+function chooseContainer(containers, cwd, title) {
+  const choice = select(title, [...containerItems(containers, cwd), '+ Start a new container']);
   return containers[choice] || null;
 }
 
@@ -477,22 +571,24 @@ function pickContainer(containers, cwd) {
   return chooseContainer(containers, cwd, 'Pick a container:');
 }
 
-function createArgs(name, folder, secrets, sf) {
+// org is the alias or username of the container's default org, if any.
+function createArgs(name, folder, secrets, org) {
   const workdir = containerPath(folder);
   const args = [
     'run', '-d', '--init', '--name', name,
     '--label', `${LABEL_FOLDER}=${folder}`,
     '--label', `${LABEL_MOUNTS}=${mountsHash(workdir, secrets)}`,
+    '--label', `${LABEL_SF}=1`,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--mount', `type=bind,source=${folder},target=${workdir}`,
     '--mount', `type=volume,source=${CONFIG_VOLUME},target=/claude-config`,
     '--mount', `type=volume,source=${CURSOR_VOLUME},target=/cursor-config`,
+    '--mount', `type=volume,source=${SF_VOLUME},target=/sf-config`,
     '-w', workdir,
   ];
-  if (sf) {
-    args.push('--label', `${LABEL_SF}=1`, '--mount', `type=volume,source=${SF_VOLUME},target=/sf-config`);
-  }
+  // Unlike a project's .sf/config.json, this applies to this container only.
+  if (org) args.push('--label', `${LABEL_ORG}=${org}`, '-e', `SF_TARGET_ORG=${org}`);
 
   for (const s of secrets) {
     const target = path.posix.join(workdir, s.rel);
@@ -507,7 +603,7 @@ function createArgs(name, folder, secrets, sf) {
   }
 
   // The container only idles; each claude session is a separate docker exec.
-  args.push(sf ? SF_IMAGE : IMAGE, 'sleep', 'infinity');
+  args.push(IMAGE, 'sleep', 'infinity');
   return args;
 }
 
@@ -542,7 +638,7 @@ function hostSf(args, env = {}) {
     stdio: ['ignore', 'pipe', 'ignore'],
     env: { ...process.env, ...env },
   });
-  if (res.error) fail('--sf-org needs the Salesforce CLI (sf) installed on this computer');
+  if (res.error) return { status: 1, missing: true, message: 'the Salesforce CLI (sf) is not installed on this computer' };
   try {
     return JSON.parse(res.stdout);
   } catch {
@@ -552,20 +648,21 @@ function hostSf(args, env = {}) {
 
 // Reads an org's login from sf on the host. The sfdxAuthUrl holds a refresh
 // token, which works anywhere, unlike the host's stored tokens: on macOS those
-// are encrypted with a key in the Keychain.
-function exportSfOrg(org) {
+// are encrypted with a key in the Keychain. onError gets the reason it failed,
+// and its result is returned instead.
+function exportSfOrg(org, onError = fail) {
   // Older sf versions include the URL here. Newer ones redact it unless
   // SF_TEMP_SHOW_SECRETS is set, and will stop showing it at all, so then
   // 'sf org auth show-sfdx-auth-url' is used instead.
   const info = hostSf(['org', 'display', '--target-org', org, '--verbose'], { SF_TEMP_SHOW_SECRETS: 'true' });
   if (info.status !== 0 || !info.result) {
-    fail(`sf on this computer: ${sfMessage(info.message) || `could not read org ${org}`}`);
+    return onError(`sf on this computer: ${sfMessage(info.message) || `could not read org ${org}`}`);
   }
   const { alias, username } = info.result;
   let url = info.result.sfdxAuthUrl;
   if (!url?.startsWith('force://')) url = hostSf(['org', 'auth', 'show-sfdx-auth-url', '--target-org', org]).result?.sfdxAuthUrl;
   if (!url?.startsWith('force://')) {
-    fail(`${org} has no refresh token to copy. Orgs authorized with JWT (including scratch orgs created from a JWT-authorized Dev Hub) don't have one.`);
+    return onError(`${org} has no refresh token to copy. Orgs authorized with JWT (including scratch orgs created from a JWT-authorized Dev Hub) don't have one.`);
   }
   return { org, url, alias: alias || (org !== username ? org : null) };
 }
@@ -602,8 +699,106 @@ function cursorVolumeArgs(image) {
   ];
 }
 
+// Copies each claude-box volume into its bagn volume, if the bagn one
+// doesn't exist yet. Runs as root in a throwaway container, like
+// cursorVolumeArgs, and keeps ownership and permissions.
+function migrateLegacyVolumes() {
+  for (const [from, to] of LEGACY_VOLUMES) {
+    if (dockerOut(['volume', 'inspect', to]) !== null || dockerOut(['volume', 'inspect', from]) === null) continue;
+    console.error(`bagn: copying logins from the ${from} volume to ${to}`);
+    const res = docker([
+      'run', '--rm', '--user', 'root', '--network', 'none',
+      '--mount', `type=volume,source=${from},target=/from,readonly`,
+      '--mount', `type=volume,source=${to},target=/to`,
+      IMAGE, 'cp', '-a', '/from/.', '/to/',
+    ], 'ignore');
+    if (res.status !== 0) {
+      // Remove the partial copy so the next run tries again.
+      docker(['volume', 'rm', to], 'ignore');
+      console.error(`bagn: could not copy ${from}; you may need to log in again`);
+    }
+  }
+}
+
 function stopIfIdle(name) {
   if (sessionCount(name) === 0) docker(['stop', '-t', '2', name], 'ignore');
+}
+
+// Lists the unexpired scratch orgs from sf on this computer. Returns
+// { orgs } or { error }.
+function hostScratchOrgs() {
+  console.error('bagn: reading scratch orgs from sf on this computer...');
+  const list = hostSf(['org', 'list', '--skip-connection-status']);
+  if (list.status !== 0 || !list.result) {
+    return { error: list.missing ? list.message : `sf on this computer: ${sfMessage(list.message) || 'could not list orgs'}` };
+  }
+  const scratch = list.result.scratchOrgs || [];
+  const orgs = scratch.filter((o) => !o.isExpired && o.status !== 'Deleted');
+  if (scratch.length > orgs.length) console.error(`bagn: leaving out ${scratch.length - orgs.length} expired scratch org(s)`);
+  return { orgs };
+}
+
+function scratchOrgItems(orgs) {
+  return formatTable(orgs.map((o) => [
+    o.alias || '(no alias)', o.username, o.expirationDate ? `expires ${o.expirationDate}` : '',
+  ]));
+}
+
+// Offers the scratch orgs from sf on this computer for a new container, and
+// returns the chosen org's login, or null to start without one.
+function chooseNewContainerOrg() {
+  const { orgs, error } = hostScratchOrgs();
+  if (error) {
+    console.error(`bagn: ${error}; starting without a scratch org`);
+    return null;
+  }
+  if (!orgs.length) {
+    console.error('bagn: no active scratch orgs on this computer; starting without one');
+    return null;
+  }
+  const choice = select('Scratch org for the new container:', [...scratchOrgItems(orgs), '- None']);
+  const org = orgs[choice];
+  if (!org) return null;
+  return exportSfOrg(org.username, (msg) => {
+    console.error(`bagn: ${msg}`);
+    console.error('bagn: starting without a scratch org');
+    return null;
+  });
+}
+
+// Copies a scratch org's login from sf on this computer into a container
+// that has sf, choosing both interactively.
+function linkOrg(cwd) {
+  if (!interactive()) fail('--link-org needs an interactive terminal');
+
+  console.error('bagn: looking for containers with the Salesforce CLI...');
+  const containers = listContainers({ sessions: true }).filter((c) => c.sf);
+  if (!containers.length) fail('no containers have the Salesforce CLI. Start one with bagn --new');
+  const container = containers[select('Link a scratch org to which container?', containerItems(containers, cwd))];
+
+  const { orgs, error } = hostScratchOrgs();
+  if (error) fail(error);
+  if (!orgs.length) fail('sf on this computer has no active scratch orgs');
+  const org = orgs[select('Which scratch org?', scratchOrgItems(orgs))];
+  const label = org.alias || org.username;
+
+  console.error(`bagn: reading the login for ${label} from sf on this computer...`);
+  const login = exportSfOrg(org.username);
+
+  const name = container.name;
+  if (!container.running) {
+    console.error(`bagn: starting ${name}...`);
+    if (docker(['start', name], 'ignore').status !== 0) fail(`could not start ${name}`);
+  }
+  console.error(`bagn: logging in to ${label} inside ${name}...`);
+  const err = importSfOrg(name, login);
+  // Leave the container as it was found.
+  if (!container.running) stopIfIdle(name);
+  if (err) fail(`could not link ${label}: ${err}`);
+
+  console.error(`bagn: linked ${label} (${org.username}) to ${name}`);
+  console.error(`  In the container: sf org open --target-org ${shellQuote(label)}`);
+  console.error(`  sf logins are stored in the ${SF_VOLUME} volume, so every container can use it.`);
 }
 
 function main() {
@@ -614,11 +809,17 @@ function main() {
   }
 
   const cwd = fs.realpathSync(process.cwd());
-  if (opts.shell && opts.cursor) fail('--shell and --cursor cannot be combined');
-  if (opts.shell && opts.yolo) fail('--yolo applies to claude or --cursor, not --shell');
+  if (opts.claude && opts.cursor) fail('--claude and --cursor cannot be combined');
+  if (opts.shell && (opts.claude || opts.cursor)) fail(`--shell and ${opts.cursor ? '--cursor' : '--claude'} cannot be combined`);
+  if (opts.shell && opts.yolo) fail('--yolo applies to claude or cursor-agent, not --shell');
+  // Only ask for a default when a session is about to start.
+  const startsAgent = !opts.shell && !opts.list && !opts.prune && !opts.linkOrg;
+  let agent = 'claude';
+  if (opts.cursor) agent = 'cursor';
+  else if (!opts.claude && startsAgent) agent = defaultAgent(!opts.dryRun);
   let command = ['claude', ...(opts.yolo ? ['--dangerously-skip-permissions'] : [])];
   if (opts.shell) command = ['bash'];
-  else if (opts.cursor) command = ['cursor-agent', ...(opts.yolo ? ['--yolo'] : [])];
+  else if (agent === 'cursor') command = ['cursor-agent', ...(opts.yolo ? ['--yolo'] : [])];
   command.push(...passArgs);
 
   if (opts.dryRun) {
@@ -626,12 +827,12 @@ function main() {
     const secrets = scanSecrets(cwd);
     printSecrets(secrets);
     const name = containerName(cwd);
-    console.log(['docker', ...createArgs(name, cwd, secrets, opts.sf)].map(shellQuote).join(' '));
+    console.log(['docker', ...createArgs(name, cwd, secrets, null)].map(shellQuote).join(' '));
     for (const org of opts.sfOrgs) {
       const args = importArgs(name, { alias: org });
       console.log(`${['docker', ...args].map(shellQuote).join(' ')} < (sfdxAuthUrl from: sf org display -o ${shellQuote(org)} --verbose)`);
     }
-    if (opts.cursor) console.log(['docker', ...cursorVolumeArgs(opts.sf ? SF_IMAGE : IMAGE)].map(shellQuote).join(' '));
+    if (agent === 'cursor') console.log(['docker', ...cursorVolumeArgs(IMAGE)].map(shellQuote).join(' '));
     console.log(['docker', ...execArgs(name, opts, command)].map(shellQuote).join(' '));
     return;
   }
@@ -645,8 +846,17 @@ function main() {
     return;
   }
 
+  if (opts.linkOrg) {
+    linkOrg(cwd);
+    return;
+  }
+
   if (opts.prune) {
-    const stopped = listContainers().filter((c) => !c.running).map((c) => c.name);
+    const legacy = dockerOut(['ps', '-a', '--filter', `label=${LEGACY_LABEL_FOLDER}`, '--filter', 'status=exited', '--filter', 'status=created', '--format', '{{.Names}}']);
+    const stopped = [
+      ...listContainers().filter((c) => !c.running).map((c) => c.name),
+      ...(legacy ? legacy.split('\n') : []),
+    ];
     if (!stopped.length) console.error('bagn: no stopped containers to remove');
     else if (docker(['rm', ...stopped], 'ignore').status !== 0) fail('docker rm failed');
     else console.error(`bagn: removed ${stopped.join(', ')}`);
@@ -656,13 +866,12 @@ function main() {
   // Read host logins first, so a missing org fails before any docker work.
   const orgs = opts.sfOrgs.map(exportSfOrg);
 
+  if (opts.sf) console.error('bagn: --sf is no longer needed; every container has the Salesforce CLI');
+
   let target = opts.pick ? pickContainer(listContainers({ sessions: true }), cwd) : null;
-  // A picked container keeps its own image variant.
-  const sf = target ? target.sf : opts.sf;
-  if (orgs.length && !sf) fail(`${target.name} has no Salesforce CLI; pick an sf container or use --new`);
-  const image = sf ? SF_IMAGE : IMAGE;
-  ensureImage(image, sf, opts.rebuild);
-  const imageId = dockerOut(['image', 'inspect', '-f', '{{.Id}}', image]);
+  ensureImage(IMAGE, opts.rebuild);
+  migrateLegacyVolumes();
+  const imageId = dockerOut(['image', 'inspect', '-f', '{{.Id}}', IMAGE]);
 
   const folder = target ? target.folder : cwd;
   if (!target) checkFolder(folder, opts.force);
@@ -678,7 +887,7 @@ function main() {
       fail(`${target.name}'s mounts are out of date (secret files in ${folder} changed, or bagn was updated). Run with --new from that folder.`);
     }
   } else if (!opts.new) {
-    const mine = listContainers().filter((c) => c.folder === folder && c.sf === sf);
+    const mine = listContainers().filter((c) => c.folder === folder);
     const usable = mine.filter((c) => c.image === imageId && c.mounts === hash);
     if (!usable.length && mine.length) {
       console.error("bagn: this folder's containers are out of date (image rebuilt, secret files changed, or bagn updated)");
@@ -698,9 +907,19 @@ function main() {
     console.error(`bagn: reusing container ${name}`);
     if (!target.running && docker(['start', name], 'ignore').status !== 0) fail(`could not start ${name}`);
   } else {
+    // A new container can start logged in to a scratch org, which becomes
+    // its default org.
+    let defaultOrg = null;
+    if (!orgs.length && !opts.noOrg && interactive()) {
+      const login = chooseNewContainerOrg();
+      if (login) {
+        orgs.push(login);
+        defaultOrg = login.alias || login.org;
+      }
+    }
     name = containerName(folder);
     console.error(`bagn: starting new container ${name}`);
-    if (docker(createArgs(name, folder, secrets, sf), 'ignore').status !== 0) fail('docker run failed');
+    if (docker(createArgs(name, folder, secrets, defaultOrg), 'ignore').status !== 0) fail('docker run failed');
   }
 
   for (const org of orgs) {
@@ -712,7 +931,7 @@ function main() {
     console.error(`bagn: linked org ${org.alias || org.org}`);
   }
 
-  if (opts.cursor && docker(cursorVolumeArgs(image), 'ignore').status !== 0) {
+  if (agent === 'cursor' && docker(cursorVolumeArgs(IMAGE), 'ignore').status !== 0) {
     console.error(`bagn: could not set ownership of the ${CURSOR_VOLUME} volume; cursor-agent login may fail`);
   }
 
