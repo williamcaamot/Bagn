@@ -36,6 +36,13 @@ Without an interactive terminal the most recent one is reused. Each `bagn` call 
 and they share the same container. Different folders get separate containers. The
 container stops when its last session ends, and the next run starts it again.
 
+Closing a terminal window instead of exiting claude leaves the session running in the
+container with nothing attached, so the container never stops. `bagn --list` shows these
+as orphaned, and `bagn --clean` stops them (claude gets a TERM first, so `/resume` still
+has the conversation). bagn knows a session is orphaned because the bagn process that
+started it is gone. Sessions started by an older bagn can't be told apart that way: the
+newest ones count as live, one for each `docker exec` still running on your computer.
+
 | Flag | What it does |
 | --- | --- |
 | `--yolo` | Skip permission prompts: `claude --dangerously-skip-permissions`, or `cursor-agent --yolo` |
@@ -48,6 +55,7 @@ container stops when its last session ends, and the next run starts it again.
 | `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the containers' `sf`, keeping its alias. Repeatable |
 | `--no-org` | Don't ask for a scratch org when starting a new container |
 | `--link-org` | Pick a container, then one of the scratch orgs from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
+| `--clean` | Stop sessions left running after their terminal was closed, and stop containers left without sessions |
 | `--prune` | Remove all stopped bagn containers |
 
 A container is only reused if it was built from the current image and the folder's

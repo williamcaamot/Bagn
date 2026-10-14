@@ -101,6 +101,8 @@ Options:
   --no-org      Don't ask for a scratch org when starting a new container
   --link-org    Choose a container and a scratch org from sf on this
                 computer, and copy the org's login into the container
+  --clean       Stop sessions left running after their terminal was closed,
+                and stop containers left without sessions
   --prune       Remove all stopped bagn containers
   --api-key     Pass ANTHROPIC_API_KEY from your shell into the session
                 (default: nothing from your environment is passed)
@@ -146,6 +148,7 @@ const FLAGS = {
   '--sf': 'sf',
   '--no-org': 'noOrg',
   '--prune': 'prune',
+  '--clean': 'clean',
   '--link-org': 'linkOrg',
   '--api-key': 'apiKey',
   '--rebuild': 'rebuild',
@@ -342,16 +345,105 @@ function containerPath(folder) {
   return path.posix.join(FALLBACK_ROOT, `${slug(folder)}-${hash}`);
 }
 
-// Processes started with `docker exec` have no parent inside the container
-// (ppid 0). Excludes PID 1 (the init process) and this ps itself.
+// Prints each process started with `docker exec` (it has no parent inside the
+// container, ppid 0) as "pid starttime hostpid", where hostpid is the
+// BAGN_HOST_PID it was started with, or - for one started by an older bagn.
+// Skips PID 1 (the init process) and this shell itself.
+const SESSION_SCAN = `
+for d in /proc/[0-9]*; do
+  p=\${d#/proc/}
+  if [ "$p" = 1 ] || [ "$p" = $$ ]; then continue; fi
+  [ "$(awk '/^PPid:/ {print $2}' "$d/status" 2>/dev/null)" = 0 ] || continue
+  start=$(cut -d' ' -f22 "$d/stat" 2>/dev/null)
+  host=$(tr '\\0' '\\n' < "$d/environ" 2>/dev/null | sed -n 's/^BAGN_HOST_PID=//p')
+  echo "$p \${start:-0} \${host:--}"
+done`;
+
+function hostPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+// Counts the `docker exec` clients for a container running on this computer,
+// or returns null where ps isn't available.
+function hostExecClients(name) {
+  if (process.platform === 'win32') return null;
+  const res = spawnSync('ps', ['-axo', 'command='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (res.status !== 0) return null;
+  return res.stdout.split('\n').filter((line) => {
+    const args = line.trim().split(/\s+/);
+    return args[0].endsWith('docker') && args[1] === 'exec' && args.includes(name);
+  }).length;
+}
+
+// Splits a container's sessions into live ones and orphans. Closing a terminal
+// kills the docker exec client but not the process it started in the
+// container, which keeps running with nothing attached. Each session carries
+// the pid of the bagn that started it, so it is an orphan once that bagn is
+// gone. Sessions from an older bagn carry no pid: as many of the newest as
+// there are unaccounted docker exec clients on this computer count as live.
+function sessions(name) {
+  const clients = hostExecClients(name);
+  const out = dockerOut(['exec', name, 'sh', '-c', SESSION_SCAN]);
+  if (out === null) return { live: [], orphans: [] };
+  const live = [];
+  const orphans = [];
+  const untagged = [];
+  for (const line of out.split('\n').filter(Boolean)) {
+    const [pid, start, host] = line.trim().split(/\s+/);
+    if (host === '-') untagged.push({ pid, start: Number(start) });
+    else (hostPidAlive(Number(host)) ? live : orphans).push(pid);
+  }
+  untagged.sort((a, b) => b.start - a.start);
+  const slots = clients === null ? untagged.length : Math.max(0, clients - live.length);
+  untagged.forEach((s, i) => (i < slots ? live : orphans).push(s.pid));
+  return { live, orphans };
+}
+
 function sessionCount(name) {
-  const out = dockerOut(['exec', name, 'ps', '-eo', 'pid=,ppid=']);
-  if (out === null) return 0;
-  const top = out.split('\n').filter((line) => {
-    const [pid, ppid] = line.trim().split(/\s+/);
-    return ppid === '0' && pid !== '1';
-  });
-  return Math.max(0, top.length - 1);
+  return sessions(name).live.length;
+}
+
+function sessionStats(name) {
+  const { live, orphans } = sessions(name);
+  return { sessions: live.length, orphans: orphans.length };
+}
+
+// Stops the orphaned sessions in a container: TERM so claude can save, then
+// KILL whatever is left. Returns how many there were.
+function killOrphans(name) {
+  const { orphans } = sessions(name);
+  if (orphans.length) {
+    const pids = orphans.join(' ');
+    docker(['exec', name, 'sh', '-c', `kill -TERM ${pids}; sleep 2; kill -KILL ${pids}`], 'ignore');
+  }
+  return orphans.length;
+}
+
+// Stops orphaned sessions in every running container, including old
+// claude-box ones, and stops each container that is left without sessions.
+function clean() {
+  const legacy = dockerOut(['ps', '--filter', `label=${LEGACY_LABEL_FOLDER}`, '--format', '{{.Names}}']);
+  const names = [
+    ...listContainers().filter((c) => c.running).map((c) => c.name),
+    ...(legacy ? legacy.split('\n') : []),
+  ];
+  if (!names.length) {
+    console.error('bagn: no running containers');
+    return;
+  }
+  for (const name of names) {
+    const killed = killOrphans(name);
+    const left = sessionCount(name);
+    if (!left) docker(['stop', '-t', '2', name], 'ignore');
+    const what = killed ? `stopped ${killed} orphaned session${killed > 1 ? 's' : ''}` : 'no orphaned sessions';
+    const state = left ? `${left} session${left > 1 ? 's' : ''} still open` : 'container stopped';
+    console.error(`bagn: ${name}: ${what}, ${state}`);
+  }
 }
 
 function listContainers({ sessions = false } = {}) {
@@ -375,7 +467,7 @@ function listContainers({ sessions = false } = {}) {
       image: c.Image,
       sf: c.Config.Labels[LABEL_SF] === '1',
       org: c.Config.Labels[LABEL_ORG] || null,
-      sessions: sessions && running ? sessionCount(name) : 0,
+      ...(sessions && running ? sessionStats(name) : { sessions: 0, orphans: 0 }),
     };
   });
   return containers.sort((a, b) => b.lastUsed - a.lastUsed);
@@ -392,6 +484,7 @@ function ago(ms) {
 function statusText(c) {
   let status = `last used ${ago(c.lastUsed)}`;
   if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
+  if (c.orphans) status += `, ${c.orphans} orphaned (bagn --clean)`;
   if (c.org) status += `, org ${c.org}`;
   return status;
 }
@@ -619,6 +712,8 @@ function execArgs(name, opts, command) {
     if (!process.env.ANTHROPIC_API_KEY) fail('--api-key given but ANTHROPIC_API_KEY is not set');
     args.push('-e', 'ANTHROPIC_API_KEY');
   }
+  // Lets later runs tell whether this session's terminal is still open.
+  args.push('-e', `BAGN_HOST_PID=${process.pid}`);
   args.push(name, ...command);
   return args;
 }
@@ -813,7 +908,7 @@ function main() {
   if (opts.shell && (opts.claude || opts.cursor)) fail(`--shell and ${opts.cursor ? '--cursor' : '--claude'} cannot be combined`);
   if (opts.shell && opts.yolo) fail('--yolo applies to claude or cursor-agent, not --shell');
   // Only ask for a default when a session is about to start.
-  const startsAgent = !opts.shell && !opts.list && !opts.prune && !opts.linkOrg;
+  const startsAgent = !opts.shell && !opts.list && !opts.prune && !opts.clean && !opts.linkOrg;
   let agent = 'claude';
   if (opts.cursor) agent = 'cursor';
   else if (!opts.claude && startsAgent) agent = defaultAgent(!opts.dryRun);
@@ -848,6 +943,11 @@ function main() {
 
   if (opts.linkOrg) {
     linkOrg(cwd);
+    return;
+  }
+
+  if (opts.clean) {
+    clean();
     return;
   }
 
