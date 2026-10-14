@@ -741,6 +741,23 @@ function hostSf(args, env = {}) {
   }
 }
 
+// Whether sf is on this computer's PATH, checked without running it (sf is
+// slow to start).
+function hostHasSf() {
+  const exts = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';')
+    : [''];
+  return (process.env.PATH || '').split(path.delimiter).some((dir) => dir && exts.some((ext) => {
+    try {
+      const file = path.join(dir, `sf${ext}`);
+      fs.accessSync(file, process.platform === 'win32' ? fs.constants.F_OK : fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  }));
+}
+
 // Reads an org's login from sf on the host. The sfdxAuthUrl holds a refresh
 // token, which works anywhere, unlike the host's stored tokens: on macOS those
 // are encrypted with a key in the Keychain. onError gets the reason it failed,
@@ -1010,7 +1027,7 @@ function main() {
     // A new container can start logged in to a scratch org, which becomes
     // its default org.
     let defaultOrg = null;
-    if (!orgs.length && !opts.noOrg && interactive()) {
+    if (!orgs.length && !opts.noOrg && interactive() && hostHasSf()) {
       const login = chooseNewContainerOrg();
       if (login) {
         orgs.push(login);
