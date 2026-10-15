@@ -16,14 +16,14 @@ RUN curl -fsSL https://cursor.com/install -o /tmp/cursor-install.sh \
  && ln -s /opt/cursor/.local/bin/cursor-agent /usr/local/bin/cursor-agent \
  && ln -s /opt/cursor/.local/bin/agent /usr/local/bin/agent
 
-# /claude-config is backed by a named volume so login survives between runs
-# without ever touching the host's ~/.claude. World-writable so it also works
+# /claude-config is backed by a named volume (one per folder) so login survives
+# between runs without ever touching the host's ~/.claude. World-writable so it also works
 # when the container runs as the host uid on Linux.
 RUN mkdir -p /claude-config /workspace \
  && chmod 777 /claude-config /workspace /home/node
 
 # Cursor keeps settings in ~/.cursor and its login in ~/.config/cursor. Both
-# point into /cursor-config, a named volume shared by all containers. Owned by
+# point into /cursor-config, a named volume per folder. Owned by
 # node because Cursor chmods them, which only the owner may do.
 RUN mkdir -p /cursor-config/home /cursor-config/config /home/node/.config \
  && chmod -R 777 /cursor-config /home/node/.config \
@@ -31,8 +31,8 @@ RUN mkdir -p /cursor-config/home /cursor-config/config /home/node/.config \
  && ln -s /cursor-config/home /home/node/.cursor \
  && ln -s /cursor-config/config /home/node/.config/cursor
 
-# Salesforce CLI. Its login (~/.sf, ~/.sfdx) lives in the /sf-config volume,
-# shared by all containers.
+# Salesforce CLI. Its logins (~/.sf, ~/.sfdx) live in /sf-config, which is
+# not a volume, so each container has only the orgs copied into it.
 RUN npm install -g @salesforce/cli \
  && mkdir -p /sf-config/sf /sf-config/sfdx \
  && chmod -R 777 /sf-config \

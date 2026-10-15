@@ -21,9 +21,9 @@ saves the answer in `~/.config/bagn/config.json` (delete it to be asked again).
 Install locally while developing: `npm link` in this folder, then `bagn` anywhere.
 
 The first run builds the image (`bagn:<version>`). Run `claude /login` (or
-just start `bagn` and follow the prompt) once; the login is stored in the
-Docker volume `bagn-claude`, not in your host `~/.claude`. Alternatively use
-`--api-key` to pass `ANTHROPIC_API_KEY` from your shell.
+just start `bagn` and follow the prompt) once per folder; the login is stored in
+that folder's Docker volume (`bagn-claude-<folder>-<hash>`), not in your host
+`~/.claude`. Alternatively use `--api-key` to pass `ANTHROPIC_API_KEY` from your shell.
 
 ## Containers
 
@@ -52,14 +52,15 @@ newest ones count as live, one for each `docker exec` still running on your comp
 | `--shell` | Open `bash` in the container instead of `claude`. Combines with `--pick`/`--new` |
 | `--claude` | Run Claude Code this time, whatever the default is |
 | `--cursor` | Run the Cursor CLI (`cursor-agent`) this time, whatever the default is |
-| `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the containers' `sf`, keeping its alias. Repeatable |
+| `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the container's `sf`, keeping its alias. Repeatable |
 | `--no-org` | Don't ask for a scratch org when starting a new container |
 | `--link-org` | Pick a container, then one of the scratch orgs from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
+| `--limits[=memory=8g,cpus=4,pids=2048]` | Limit the container's memory (no swap), CPUs and number of processes, e.g. against a fork bomb or runaway build. Keys left out get the default shown, lowered to fit what Docker has. Applied when a container is created, and changed with `docker update` when one is reused |
 | `--clean` | Stop sessions left running after their terminal was closed, and stop containers left without sessions |
 | `--prune` | Remove all stopped bagn containers |
 
 A container is only reused if it was built from the current image and the folder's
-hidden secret files are the same as when it was created. The secret mounts can't be
+hidden secret files and read-only git files are the same as when it was created. The mounts can't be
 changed on an existing container. If either has changed, a new container is started and the
 old one is left for `--prune`.
 
@@ -67,7 +68,15 @@ Unknown options are an error. Arguments for `claude` go after `--`, as do argume
 `cursor-agent` with `--cursor` and `bash` with `--shell` (`bagn --shell -- -c "git status"`).
 Most claude options can also be set inside a session, e.g. `/resume` and `/model`.
 
-The Claude login volume `bagn-claude` is shared by all containers. The folder is
+Each folder has its own Claude Code config volume, `bagn-claude-<folder>-<hash>`
+(login, settings, plugins, history), shared by that folder's containers but by no
+other folder. A hook, MCP server or setting planted from one project therefore can't run in
+another. The first time a folder gets its volume, it's seeded from the old shared
+`bagn-claude` volume, if you have one: settings, `CLAUDE.md`, agents, commands, skills
+and plugins, plus only this folder's sessions and prompt history, so `/resume` still finds
+them. The login and other folders' history aren't copied, so you log in again. Once
+every folder you use has its own volume, you can `docker volume rm bagn-claude`.
+`docker volume ls --filter label=bagn.folder` lists the folder volumes. The folder is
 mounted at the same path inside the container as on your machine (e.g.
 `/Users/you/project`), so Claude Code keeps separate sessions, `--resume` history and
 memory for each folder, and the paths it prints match yours. Folders under system
@@ -77,11 +86,14 @@ paths like `/usr`, `/var` or `/tmp` itself are mounted at `/workspace/<name>-<ha
 
 The Cursor CLI (`cursor-agent`, also available as `agent`) is installed in every
 image. Run it with `bagn --cursor` (or make it the default on the first run), or call it from `--shell`/Claude. Log in
-once with `bagn --cursor -- login`. The login is kept in the Docker volume
-`bagn-cursor`.
+once per folder with `bagn --cursor -- login`. The login and settings are kept in the
+folder's Docker volume `bagn-cursor-<folder>-<hash>`. Nothing is copied from the old
+shared `bagn-cursor` volume, which you can delete.
 
 The Salesforce CLI (`sf`) is also installed in every image. Its logins are kept in the
-volume `bagn-sf`, so every container has them. (`--sf` is no longer needed and is ignored.)
+container itself, so a container can only use the orgs copied into it, and
+`--prune` deletes them with the container. (`--sf` is no longer needed and is ignored.)
+The old shared `bagn-sf` volume isn't used any more; delete it with `docker volume rm bagn-sf`.
 
 When bagn starts a new container in an interactive terminal, it lists the active scratch
 orgs from `sf` on your computer. Pick one (or "None") and its login is copied into the
@@ -110,13 +122,13 @@ To log in from inside the container instead, use `sf org login device` (or
 `sf org login jwt`) in a `bagn --shell` session. `sf org login web` doesn't work, because
 it waits for a callback on the container's localhost, which your browser can't reach.
 
-bagn used to be called claude-box. The first run copies the old `claude-box-*` volumes
-into the new `bagn-*` ones, so you stay logged in, and a `.claudeboxignore` file is
+bagn used to be called claude-box. The first run copies the old `claude-box-config`
+volume into `bagn-claude`, so folder volumes are seeded from it, and a `.claudeboxignore` file is
 still read. Old containers aren't reused. `--prune` removes the stopped ones, and you
 can delete the old volumes with `docker volume rm claude-box-config claude-box-cursor claude-box-sf`.
 
-Like the Claude login, these logins are shared by every container and folder,
-and anything running in the container (including Claude) can read them.
+Anything running in a container (including Claude) can read the logins in it: the
+folder's Claude and Cursor logins and the orgs copied into that container.
 
 ## What's protected
 
@@ -126,6 +138,9 @@ and anything running in the container (including Claude) can read them.
 | `.env` and other secret files in the folder | Each match is bind-mounted over with `/dev/null` (read-only), so it appears empty. Secret directories (`.aws`, `.ssh`, ...) get an empty read-only tmpfs. The hidden paths are printed at startup. |
 | Files outside the folder | Only the current folder is mounted. Running in `~` or `/` is refused unless you pass `--force`. |
 | Your SSH keys, git credentials, Docker socket, `~/.claude` | Not mounted. |
+| Git running planted code on your computer | `.git/config` and `.git/hooks` are mounted read-only, as are `config.worktree` files and the `config` and `hooks` of submodules in `.git/modules`, plus a `core.hooksPath` inside the folder (e.g. `.husky`). A missing `.git/hooks` is created first so it can't be added. Otherwise the container could add a hook or a `core.fsmonitor` command that runs the next time you use git on your computer. The protected paths are printed at startup. |
+| One project affecting others | Claude Code and Cursor config (hooks, MCP servers, settings, plugins, logins) is per folder, and Salesforce logins are per container. |
+| Runaway processes | With `--limits`, memory, CPUs and the number of processes are capped. |
 | Container escape | All capabilities are dropped, `no-new-privileges` is set, and Claude runs as a non-root user. |
 
 Use `--dry-run` to see exactly which files get hidden and the full `docker run`/`docker exec` commands.
@@ -153,6 +168,8 @@ Defaults: `.env`, `.env.*` (except `.env.example`/`.sample`/`.template`), `.envr
 - **Files created after startup.** The scan runs when a session starts. A secret file created while a session is running stays visible until the next start, which then gets a new container.
 - **Network.** The container has internet access (Claude needs it), so anything it can read could be sent out.
 - **Writes.** Claude can change or delete anything in the folder that isn't masked. Commit first.
+- **Other files your computer runs.** Only git's own config and hooks are read-only. Project files that tools on your computer run, such as `package.json` scripts, `Makefile`, `.vscode/tasks.json`, `.envrc` or a project's `.claude/settings.json` hooks, can still be changed. Review the diff before running anything from the folder on your computer.
+- **New repos.** If the folder has no `.git` when the container is created, a repo created inside it later (`git init`) has writable hooks. Start a new container (`--new`) after creating it.
 
 ## Notes
 
@@ -161,3 +178,4 @@ Defaults: `.env`, `.env.*` (except `.env.example`/`.sample`/`.template`), `.envr
 - Update Claude Code, Cursor and the Salesforce CLI with `bagn --rebuild`. It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
 - Containers keep their own filesystem changes (e.g. tools installed in `~`) between sessions. Use `--new` for a clean one.
 - Background processes started in a session are stopped when the container's last session ends.
+- Since `.git/config` is read-only, git commands in the container that change it fail, e.g. `git remote add`, `git push -u`, `git branch --set-upstream-to` or installing hooks (`husky`, `pre-commit install`). Run those on your computer. Committing, branching, fetching and pushing work. A change to `.git/config` made on your computer shows up in a running container after it restarts (it stops when its last session ends).

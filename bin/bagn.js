@@ -11,26 +11,33 @@ const tty = require('node:tty');
 const pkg = require('../package.json');
 
 const IMAGE = `bagn:${pkg.version}`;
+// Each folder gets its own Claude and Cursor volume (bagn-claude-<folder>-<hash>),
+// so one project can't plant hooks, MCP servers or settings that run in the
+// others. These unsuffixed volumes are the ones every folder shared before;
+// they're only read to seed a folder's new Claude volume.
 const CONFIG_VOLUME = 'bagn-claude';
 const CURSOR_VOLUME = 'bagn-cursor';
-const SF_VOLUME = 'bagn-sf';
 const IGNORE_FILE = '.bagnignore';
 const LABEL_FOLDER = 'bagn.folder';
 const LABEL_MOUNTS = 'bagn.mounts';
 const LABEL_SF = 'bagn.sf';
 const LABEL_ORG = 'bagn.org';
+// Part of the mounts hash. Bump it when createArgs mounts something
+// different, so older containers aren't reused.
+const MOUNTS_VERSION = 2;
+
+// --limits without a value. Defaults are lowered to fit what Docker has.
+const DEFAULT_LIMITS = { memory: '8g', cpus: '4', pids: '2048' };
 
 // Settings kept on this computer, e.g. { "agent": "cursor" }.
 const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'bagn', 'config.json');
 
-// bagn was called claude-box. Its ignore file is still read, its volumes
-// (with the logins) are copied into the new ones once, and --prune removes
-// its stopped containers.
+// bagn was called claude-box. Its ignore file is still read, its Claude
+// volume is copied into bagn-claude once (to seed folder volumes from), and
+// --prune removes its stopped containers.
 const LEGACY_IGNORE_FILE = '.claudeboxignore';
 const LEGACY_VOLUMES = [
   ['claude-box-config', CONFIG_VOLUME],
-  ['claude-box-cursor', CURSOR_VOLUME],
-  ['claude-box-sf', SF_VOLUME],
 ];
 const LEGACY_LABEL_FOLDER = 'claude-box.folder';
 
@@ -96,11 +103,15 @@ Options:
                 default is
   --sf-org <org>
                 Copy the login for an org (alias or username) from sf on this
-                computer into the containers' sf, keeping its alias. Repeat
+                computer into the container's sf, keeping its alias. Repeat
                 for more orgs
   --no-org      Don't ask for a scratch org when starting a new container
   --link-org    Choose a container and a scratch org from sf on this
                 computer, and copy the org's login into the container
+  --limits[=memory=8g,cpus=4,pids=2048]
+                Limit the container's memory, CPUs and processes. Applies to
+                a new container, and is changed on a reused one. Leave out
+                keys to use their defaults (lowered to what Docker has)
   --clean       Stop sessions left running after their terminal was closed,
                 and stop containers left without sessions
   --prune       Remove all stopped bagn containers
@@ -128,14 +139,16 @@ asked again.
 
 Every container has the Salesforce CLI (sf). When a new container starts,
 you can pick one of the scratch orgs from sf on this computer: its login is
-copied in and it becomes the container's default org (SF_TARGET_ORG).
+copied in and it becomes the container's default org (SF_TARGET_ORG). sf
+logins stay in that container.
 
-The folder is mounted at the same path inside the container, so Claude Code
-keeps separate sessions and memory for each folder.
+Each folder has its own Claude Code and Cursor config (login, settings,
+history), shared by that folder's containers, so you log in once per folder.
 
 Secret files (.env, *.pem, ...) are replaced by empty read-only files inside
 the container. Add more patterns in a ${IGNORE_FILE} file; prefix a line
-with ! to un-hide a file.`;
+with ! to un-hide a file. .git/config and .git/hooks are read-only, so
+nothing in the container can make git on this computer run its code.`;
 
 const FLAGS = {
   '--yolo': 'yolo',
@@ -161,6 +174,7 @@ const FLAGS = {
 function parseArgs(argv) {
   const opts = Object.fromEntries(Object.values(FLAGS).map((key) => [key, false]));
   opts.sfOrgs = [];
+  opts.limits = null;
   const passArgs = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -178,6 +192,10 @@ function parseArgs(argv) {
       opts.sfOrgs.push(value);
       continue;
     }
+    if (arg === '--limits' || arg.startsWith('--limits=')) {
+      opts.limits = parseLimits(arg === '--limits' ? '' : arg.slice('--limits='.length));
+      continue;
+    }
     // Options were called --box-<name> before they were shortened.
     const renamed = arg.startsWith('--box-') && `--${arg.slice(6)}`;
     if (renamed && FLAGS[renamed]) fail(`${arg} is now ${renamed}`);
@@ -185,6 +203,27 @@ function parseArgs(argv) {
     fail(`${what}. See bagn --help; pass arguments to claude after --`);
   }
   return { opts, passArgs };
+}
+
+const LIMIT_FORMATS = {
+  memory: [/^[1-9]\d*[bkmg]?$/i, 'a size like 8g or 512m'],
+  cpus: [/^(?!0+(\.0*)?$)\d+(\.\d+)?$/, 'a number like 4 or 1.5'],
+  pids: [/^[1-9]\d*$/, 'a whole number like 2048'],
+};
+
+// Parses "memory=4g,cpus=2". Keys left out get their default, and remember
+// that, so the default can be lowered to fit Docker (see fitLimits).
+function parseLimits(value) {
+  const limits = { ...DEFAULT_LIMITS, defaults: new Set(Object.keys(DEFAULT_LIMITS)) };
+  for (const part of value.split(',').filter(Boolean)) {
+    const [key, val] = part.split('=');
+    if (!LIMIT_FORMATS[key]) fail(`unknown --limits key "${key}" (use ${Object.keys(LIMIT_FORMATS).join(', ')})`);
+    const [re, what] = LIMIT_FORMATS[key];
+    if (!re.test(val || '')) fail(`--limits ${key} must be ${what}`);
+    limits[key] = val.toLowerCase();
+    limits.defaults.delete(key);
+  }
+  return limits;
 }
 
 function globToRegExp(glob) {
@@ -306,10 +345,109 @@ function printSecrets(secrets) {
   for (const s of secrets) console.error(`  - ${s.rel}${s.dir ? '/' : ''}`);
 }
 
+// Git on this computer runs hooks from these and commands from its config
+// (core.fsmonitor, core.pager, filter drivers, ...), so they're mounted
+// read-only: otherwise anything in the container could make the next git
+// command on this computer run its code. Returns paths relative to the
+// folder. Covers the repo, its submodules and linked worktrees, and a
+// core.hooksPath inside the folder (e.g. .husky). A .git file (the folder
+// is itself a worktree or submodule) points outside the folder, which isn't
+// mounted, so there's nothing to protect.
+function findGitProtected(folder) {
+  const gitDir = path.join(folder, '.git');
+  let stat;
+  try {
+    stat = fs.lstatSync(gitDir);
+  } catch {
+    return [];
+  }
+  if (!stat.isDirectory()) return [];
+
+  const found = [];
+  const add = (abs) => {
+    if (fs.existsSync(abs)) found.push(path.relative(folder, abs).split(path.sep).join('/'));
+  };
+  const protectGitDir = (dir) => {
+    // Created when missing, so the container can't add one.
+    try {
+      fs.mkdirSync(path.join(dir, 'hooks'), { recursive: true });
+    } catch {
+      // Left out if this computer can't create it either.
+    }
+    add(path.join(dir, 'hooks'));
+    add(path.join(dir, 'config'));
+    add(path.join(dir, 'config.worktree'));
+  };
+  const subdirs = (dir) => {
+    try {
+      return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => path.join(dir, e.name));
+    } catch {
+      return [];
+    }
+  };
+
+  protectGitDir(gitDir);
+  for (const dir of subdirs(path.join(gitDir, 'worktrees'))) add(path.join(dir, 'config.worktree'));
+  // Submodule git dirs are .git/modules/<name>, nested for submodules of
+  // submodules, and each has its own config and hooks.
+  const walkModules = (dir) => {
+    for (const sub of subdirs(dir)) {
+      if (fs.existsSync(path.join(sub, 'HEAD'))) {
+        protectGitDir(sub);
+        walkModules(path.join(sub, 'modules'));
+      } else {
+        walkModules(sub);
+      }
+    }
+  };
+  walkModules(path.join(gitDir, 'modules'));
+
+  const hooksPath = spawnSync('git', ['config', '--file', path.join(gitDir, 'config'), '--get', 'core.hooksPath'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const hooks = hooksPath.status === 0 && hooksPath.stdout.trim();
+  if (hooks && !hooks.startsWith('~')) {
+    const abs = path.resolve(folder, hooks);
+    const rel = path.relative(folder, abs);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) add(abs);
+  }
+  return [...new Set(found)].sort();
+}
+
+function scanGitProtected(folder, secrets) {
+  // A masked path already can't be changed, and a second mount on it would
+  // fail.
+  const masked = secrets.map((s) => s.rel);
+  const isMasked = (rel) => masked.some((m) => rel === m || rel.startsWith(`${m}/`));
+  const paths = findGitProtected(folder).filter((rel) => !isMasked(rel));
+  for (const rel of paths) {
+    if (rel.includes(',')) fail(`cannot make a path containing a comma read-only: ${rel}`);
+  }
+  return paths;
+}
+
+// The folder's own Claude Code and Cursor config volumes.
+function folderVolumes(folder) {
+  const id = crypto.createHash('sha256').update(folder).digest('hex').slice(0, 12);
+  return {
+    claude: `${CONFIG_VOLUME}-${slug(folder)}-${id}`,
+    cursor: `${CURSOR_VOLUME}-${slug(folder)}-${id}`,
+  };
+}
+
+function printGitProtected(paths) {
+  if (paths.length) console.error(`bagn: read-only in the container: ${paths.join(', ')}`);
+}
+
 // Mounts are fixed when a container is created, so a container may only be
-// reused while its mount path and masked paths are unchanged.
-function mountsHash(workdir, secrets) {
-  const key = [workdir, ...secrets.map((s) => `${s.dir ? 'd' : 'f'}:${s.rel}`).sort()].join('\n');
+// reused while what it mounts is unchanged.
+function mountsHash(folder, secrets, gitProtected) {
+  const volumes = folderVolumes(folder);
+  const key = [
+    `v${MOUNTS_VERSION}`, containerPath(folder), volumes.claude, volumes.cursor,
+    ...secrets.map((s) => `${s.dir ? 'd' : 'f'}:${s.rel}`).sort(),
+    ...gitProtected.map((rel) => `r:${rel}`),
+  ].join('\n');
   return crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
 }
 
@@ -467,6 +605,11 @@ function listContainers({ sessions = false } = {}) {
       image: c.Image,
       sf: c.Config.Labels[LABEL_SF] === '1',
       org: c.Config.Labels[LABEL_ORG] || null,
+      limits: c.HostConfig.Memory || c.HostConfig.NanoCpus || c.HostConfig.PidsLimit > 0 ? {
+        memory: c.HostConfig.Memory ? bytesText(c.HostConfig.Memory) : 'unlimited',
+        cpus: c.HostConfig.NanoCpus ? String(c.HostConfig.NanoCpus / 1e9) : 'all',
+        pids: c.HostConfig.PidsLimit > 0 ? String(c.HostConfig.PidsLimit) : 'unlimited',
+      } : null,
       ...(sessions && running ? sessionStats(name) : { sessions: 0, orphans: 0 }),
     };
   });
@@ -486,6 +629,7 @@ function statusText(c) {
   if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
   if (c.orphans) status += `, ${c.orphans} orphaned (bagn --clean)`;
   if (c.org) status += `, org ${c.org}`;
+  if (c.limits) status += `, limits ${c.limits.memory}/${c.limits.cpus} CPUs/${c.limits.pids} procs`;
   return status;
 }
 
@@ -664,29 +808,131 @@ function pickContainer(containers, cwd) {
   return chooseContainer(containers, cwd, 'Pick a container:');
 }
 
+// Lowers the defaults in limits (not values that were given) to what Docker
+// has: all its CPUs, and three quarters of its memory.
+function fitLimits(limits) {
+  const info = dockerOut(['info', '--format', '{{.NCPU}} {{.MemTotal}}']);
+  const [ncpu, memTotal] = (info || '').split(' ').map(Number);
+  const fitted = { ...limits };
+  if (limits.defaults.has('cpus') && ncpu > 0) fitted.cpus = String(Math.min(Number(limits.cpus), ncpu));
+  if (limits.defaults.has('memory') && memTotal > 0) {
+    const max = Math.floor((memTotal * 0.75) / 2 ** 20);
+    if (max < parseInt(limits.memory, 10) * 1024) fitted.memory = `${max}m`;
+  }
+  return fitted;
+}
+
+// Swap is set to the same as memory, i.e. none. docker update also needs it
+// whenever it raises memory above an existing swap limit.
+function limitArgs(limits) {
+  return [
+    '--memory', limits.memory, '--memory-swap', limits.memory,
+    '--cpus', limits.cpus, '--pids-limit', limits.pids,
+  ];
+}
+
+function limitsText(limits) {
+  return `${limits.memory} memory, ${limits.cpus} CPUs, ${limits.pids} processes`;
+}
+
+function bytesText(bytes) {
+  return bytes % 2 ** 30 === 0 ? `${bytes / 2 ** 30}g` : `${Math.round(bytes / 2 ** 20)}m`;
+}
+
+// Creates the folder's config volumes if they don't exist yet. A new Claude
+// volume is seeded from the old shared one: settings, plugins, agents and
+// commands, and this folder's history (so /resume still finds earlier
+// sessions), but not the login or other folders' history.
+function ensureFolderVolumes(folder) {
+  const volumes = folderVolumes(folder);
+  for (const volume of [volumes.claude, volumes.cursor]) {
+    if (dockerOut(['volume', 'inspect', volume]) !== null) continue;
+    if (dockerOut(['volume', 'create', '--label', `${LABEL_FOLDER}=${folder}`, volume]) === null) {
+      fail(`could not create the ${volume} volume`);
+    }
+    if (volume !== volumes.claude) continue;
+    if (dockerOut(['volume', 'inspect', CONFIG_VOLUME]) === null) continue;
+    console.error(`bagn: this folder now has its own Claude Code config. Copying settings and its history from ${CONFIG_VOLUME}; you'll need to log in again.`);
+    if (docker(seedArgs(folder, volumes.claude), 'ignore').status !== 0) {
+      console.error(`bagn: could not copy from ${CONFIG_VOLUME}; starting with an empty config`);
+    }
+  }
+}
+
+// Runs in a throwaway container, as root, with /from the shared volume and
+// /claude-config the new one. Mounting the new volume at /claude-config
+// gives it that folder's permissions from the image.
+const SEED_SCRIPT = `
+const fs = require('node:fs');
+const path = require('node:path');
+const workdir = process.argv[1];
+const copy = (rel) => {
+  const src = path.join('/from', rel);
+  if (!fs.existsSync(src)) return;
+  const dest = path.join('/claude-config', rel);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(src, dest, { recursive: true, verbatimSymlinks: true });
+};
+for (const rel of ['settings.json', 'CLAUDE.md', 'keybindings.json', 'agents', 'commands', 'skills', 'output-styles', 'plugins']) copy(rel);
+copy(path.join('projects', workdir.replace(/[^a-zA-Z0-9]/g, '-')));
+try {
+  const config = JSON.parse(fs.readFileSync('/from/.claude.json', 'utf8'));
+  for (const key of ['oauthAccount', 'primaryApiKey', 'customApiKeyResponses']) delete config[key];
+  const project = config.projects && config.projects[workdir];
+  config.projects = project ? { [workdir]: project } : {};
+  fs.writeFileSync('/claude-config/.claude.json', JSON.stringify(config, null, 2));
+} catch {}
+try {
+  const lines = fs.readFileSync('/from/history.jsonl', 'utf8').split('\\n').filter((line) => {
+    try { return JSON.parse(line).project === workdir; } catch { return false; }
+  });
+  if (lines.length) fs.writeFileSync('/claude-config/history.jsonl', lines.join('\\n') + '\\n');
+} catch {}
+`;
+
+function seedArgs(folder, volume) {
+  return [
+    'run', '--rm', '--user', 'root', '--network', 'none',
+    '--mount', `type=volume,source=${CONFIG_VOLUME},target=/from,readonly`,
+    '--mount', `type=volume,source=${volume},target=/claude-config`,
+    IMAGE, 'sh', '-c', 'node -e "$1" "$2" && chown -R "$3" /claude-config',
+    'sh', SEED_SCRIPT, containerPath(folder), containerOwner(),
+  ];
+}
+
+// The user bagn's containers run as.
+function containerOwner() {
+  return process.platform === 'linux' && process.getuid ? `${process.getuid()}:${process.getgid()}` : 'node:node';
+}
+
 // org is the alias or username of the container's default org, if any.
-function createArgs(name, folder, secrets, org) {
+// limits is from fitLimits, or null for none.
+function createArgs(name, folder, secrets, gitProtected, org, limits) {
   const workdir = containerPath(folder);
+  const volumes = folderVolumes(folder);
   const args = [
     'run', '-d', '--init', '--name', name,
     '--label', `${LABEL_FOLDER}=${folder}`,
-    '--label', `${LABEL_MOUNTS}=${mountsHash(workdir, secrets)}`,
+    '--label', `${LABEL_MOUNTS}=${mountsHash(folder, secrets, gitProtected)}`,
     '--label', `${LABEL_SF}=1`,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--mount', `type=bind,source=${folder},target=${workdir}`,
-    '--mount', `type=volume,source=${CONFIG_VOLUME},target=/claude-config`,
-    '--mount', `type=volume,source=${CURSOR_VOLUME},target=/cursor-config`,
-    '--mount', `type=volume,source=${SF_VOLUME},target=/sf-config`,
+    '--mount', `type=volume,source=${volumes.claude},target=/claude-config`,
+    '--mount', `type=volume,source=${volumes.cursor},target=/cursor-config`,
     '-w', workdir,
   ];
   // Unlike a project's .sf/config.json, this applies to this container only.
   if (org) args.push('--label', `${LABEL_ORG}=${org}`, '-e', `SF_TARGET_ORG=${org}`);
+  if (limits) args.push(...limitArgs(limits));
 
   for (const s of secrets) {
     const target = path.posix.join(workdir, s.rel);
     if (s.dir) args.push('--mount', `type=tmpfs,target=${target},tmpfs-mode=0555`);
     else args.push('--mount', `type=bind,source=/dev/null,target=${target},readonly`);
+  }
+  for (const rel of gitProtected) {
+    args.push('--mount', `type=bind,source=${path.join(folder, rel)},target=${path.posix.join(workdir, rel)},readonly`);
   }
 
   // On Linux, match the host uid so created files aren't owned by uid 1000.
@@ -802,12 +1048,11 @@ function importSfOrg(name, org) {
 // volume's folders start out owned by root (and on Linux the container runs
 // as the host uid), so hand them to the container user. This runs as root in
 // a throwaway container, since bagn's containers have no capabilities.
-function cursorVolumeArgs(image) {
-  const owner = process.platform === 'linux' && process.getuid ? `${process.getuid()}:${process.getgid()}` : 'node:node';
+function cursorVolumeArgs(image, folder) {
   return [
     'run', '--rm', '--user', 'root', '--network', 'none',
-    '--mount', `type=volume,source=${CURSOR_VOLUME},target=/cursor-config`,
-    image, 'chown', '-R', owner, '/cursor-config',
+    '--mount', `type=volume,source=${folderVolumes(folder).cursor},target=/cursor-config`,
+    image, 'chown', '-R', containerOwner(), '/cursor-config',
   ];
 }
 
@@ -910,7 +1155,7 @@ function linkOrg(cwd) {
 
   console.error(`bagn: linked ${label} (${org.username}) to ${name}`);
   console.error(`  In the container: sf org open --target-org ${shellQuote(label)}`);
-  console.error(`  sf logins are stored in the ${SF_VOLUME} volume, so every container can use it.`);
+  console.error('  The login is stored in this container only.');
 }
 
 function main() {
@@ -938,13 +1183,15 @@ function main() {
     checkFolder(cwd, opts.force);
     const secrets = scanSecrets(cwd);
     printSecrets(secrets);
+    const gitProtected = scanGitProtected(cwd, secrets);
+    printGitProtected(gitProtected);
     const name = containerName(cwd);
-    console.log(['docker', ...createArgs(name, cwd, secrets, null)].map(shellQuote).join(' '));
+    console.log(['docker', ...createArgs(name, cwd, secrets, gitProtected, null, opts.limits)].map(shellQuote).join(' '));
     for (const org of opts.sfOrgs) {
       const args = importArgs(name, { alias: org });
       console.log(`${['docker', ...args].map(shellQuote).join(' ')} < (sfdxAuthUrl from: sf org display -o ${shellQuote(org)} --verbose)`);
     }
-    if (agent === 'cursor') console.log(['docker', ...cursorVolumeArgs(IMAGE)].map(shellQuote).join(' '));
+    if (agent === 'cursor') console.log(['docker', ...cursorVolumeArgs(IMAGE, cwd)].map(shellQuote).join(' '));
     console.log(['docker', ...execArgs(name, opts, command)].map(shellQuote).join(' '));
     return;
   }
@@ -994,20 +1241,22 @@ function main() {
   if (!target) checkFolder(folder, opts.force);
   else if (!fs.existsSync(folder)) fail(`${target.name}'s folder ${folder} no longer exists`);
   const secrets = scanSecrets(folder);
-  const hash = mountsHash(containerPath(folder), secrets);
+  const gitProtected = scanGitProtected(folder, secrets);
+  const hash = mountsHash(folder, secrets, gitProtected);
+  const limits = opts.limits && fitLimits(opts.limits);
 
   if (target) {
     if (target.image !== imageId) {
       fail(`${target.name} uses an older image. Run with --new to start a fresh container.`);
     }
     if (target.mounts !== hash) {
-      fail(`${target.name}'s mounts are out of date (secret files in ${folder} changed, or bagn was updated). Run with --new from that folder.`);
+      fail(`${target.name}'s mounts are out of date (secret or git files in ${folder} changed, or bagn was updated). Run with --new from that folder.`);
     }
   } else if (!opts.new) {
     const mine = listContainers().filter((c) => c.folder === folder);
     const usable = mine.filter((c) => c.image === imageId && c.mounts === hash);
     if (!usable.length && mine.length) {
-      console.error("bagn: this folder's containers are out of date (image rebuilt, secret files changed, or bagn updated)");
+      console.error("bagn: this folder's containers are out of date (image rebuilt, secret or git files changed, or bagn updated)");
     }
     if (usable.length && interactive()) {
       for (const c of usable) c.sessions = c.running ? sessionCount(c.name) : 0;
@@ -1018,10 +1267,16 @@ function main() {
   }
 
   printSecrets(secrets);
+  printGitProtected(gitProtected);
+  if (limits) console.error(`bagn: limiting the container to ${limitsText(limits)}`);
   let name;
   if (target) {
     name = target.name;
     console.error(`bagn: reusing container ${name}`);
+    // Limits, unlike mounts, can be changed on an existing container.
+    if (limits && docker(['update', ...limitArgs(limits), name], 'ignore').status !== 0) {
+      fail(`could not change ${name}'s limits (docker update failed)`);
+    }
     if (!target.running && docker(['start', name], 'ignore').status !== 0) fail(`could not start ${name}`);
   } else {
     // A new container can start logged in to a scratch org, which becomes
@@ -1036,7 +1291,8 @@ function main() {
     }
     name = containerName(folder);
     console.error(`bagn: starting new container ${name}`);
-    if (docker(createArgs(name, folder, secrets, defaultOrg), 'ignore').status !== 0) fail('docker run failed');
+    ensureFolderVolumes(folder);
+    if (docker(createArgs(name, folder, secrets, gitProtected, defaultOrg, limits), 'ignore').status !== 0) fail('docker run failed');
   }
 
   for (const org of orgs) {
@@ -1048,8 +1304,8 @@ function main() {
     console.error(`bagn: linked org ${org.alias || org.org}`);
   }
 
-  if (agent === 'cursor' && docker(cursorVolumeArgs(IMAGE), 'ignore').status !== 0) {
-    console.error(`bagn: could not set ownership of the ${CURSOR_VOLUME} volume; cursor-agent login may fail`);
+  if (agent === 'cursor' && docker(cursorVolumeArgs(IMAGE, folder), 'ignore').status !== 0) {
+    console.error(`bagn: could not set ownership of the ${folderVolumes(folder).cursor} volume; cursor-agent login may fail`);
   }
 
   const res = docker(execArgs(name, opts, command));
