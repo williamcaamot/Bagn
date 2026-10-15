@@ -1,0 +1,43 @@
+#!/bin/bash
+# Starts PostgreSQL in a bagn container, creating the cluster in $PGDATA the
+# first time. The superuser is postgres with no password (trust), so
+# postgres://postgres@localhost:5432/postgres works. Stop it with pg_ctl stop.
+set -euo pipefail
+
+# On Linux the container runs as the host uid, which has no passwd entry.
+# initdb and postgres refuse to run without a user name.
+if ! id -un >/dev/null 2>&1; then
+  export NSS_WRAPPER_PASSWD=/tmp/bagn-passwd NSS_WRAPPER_GROUP=/etc/group
+  { cat /etc/passwd; echo "bagn:x:$(id -u):$(id -g):bagn:$HOME:/bin/bash"; } > "$NSS_WRAPPER_PASSWD"
+  LD_PRELOAD="$(ls /usr/lib/*/libnss_wrapper.so | head -n 1)"
+  export LD_PRELOAD
+fi
+
+# The container is stopped without shutting postgres down, and PIDs restart
+# from 1, so a stale postmaster.pid can name some other running process.
+pidfile="$PGDATA/postmaster.pid"
+if [ -f "$pidfile" ]; then
+  pid="$(head -n 1 "$pidfile")"
+  if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = postgres ]; then
+    echo "pg-start: PostgreSQL is already running"
+    exit 0
+  fi
+  rm -f "$pidfile"
+fi
+
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+  initdb --username=postgres --auth=trust --encoding=UTF8 --no-instructions >/dev/null
+  # Listen on all interfaces so a port published with bagn --ports reaches it.
+  # Only this computer can connect: bagn publishes ports on 127.0.0.1.
+  cat >> "$PGDATA/postgresql.conf" <<'EOF'
+listen_addresses = '*'
+unix_socket_directories = '/tmp'
+EOF
+  cat >> "$PGDATA/pg_hba.conf" <<'EOF'
+host all all 0.0.0.0/0 trust
+host all all ::/0 trust
+EOF
+fi
+
+pg_ctl start --wait --silent --log="$PGDATA/server.log"
+echo "pg-start: PostgreSQL is running: postgres://postgres@localhost:5432/postgres"

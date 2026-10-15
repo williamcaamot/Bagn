@@ -1,7 +1,8 @@
 # bagn
 
 Run Claude Code or the Cursor CLI in a Docker container that can only see the folder you're in.
-Every image comes with Claude Code, the Cursor CLI and the Salesforce CLI preinstalled.
+Every image comes with Claude Code, the Cursor CLI and the Salesforce CLI preinstalled, plus
+Node.js 22, Python 3 and PostgreSQL for development.
 
 ```sh
 cd my-project
@@ -10,6 +11,7 @@ npx bagn --yolo                   # claude --dangerously-skip-permissions
 npx bagn --shell                  # bash in the container instead of claude
 npx bagn --cursor                 # Cursor CLI instead of claude
 npx bagn --sf-org myscratch       # copy an org's login from your sf
+npx bagn --ports                  # publish dev ports 3000, 5173, 8000, 8080
 npx bagn --help                   # all options
 npx bagn -- -p "summarize this"   # everything after -- goes to claude as is
 ```
@@ -56,6 +58,7 @@ newest ones count as live, one for each `docker exec` still running on your comp
 | `--no-org` | Don't ask for a scratch org when starting a new container |
 | `--link-org` | Pick a container, then one of the scratch orgs from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
 | `--limits[=memory=8g,cpus=4,pids=2048]` | Limit the container's memory (no swap), CPUs and number of processes, e.g. against a fork bomb or runaway build. Keys left out get the default shown, lowered to fit what Docker has. Applied when a container is created, and changed with `docker update` when one is reused |
+| `--ports[=3000,5173,8000,8080]` | Publish container ports on your computer's `127.0.0.1`, each as `port` or `host:container` (e.g. `--ports=3000,15432:5432`). See [Dev tools and ports](#dev-tools-and-ports) |
 | `--clean` | Stop sessions left running after their terminal was closed, and stop containers left without sessions |
 | `--prune` | Remove all stopped bagn containers |
 
@@ -81,6 +84,36 @@ mounted at the same path inside the container as on your machine (e.g.
 `/Users/you/project`), so Claude Code keeps separate sessions, `--resume` history and
 memory for each folder, and the paths it prints match yours. Folders under system
 paths like `/usr`, `/var` or `/tmp` itself are mounted at `/workspace/<name>-<hash>` instead.
+
+## Dev tools and ports
+
+Every image has Node.js 22 with npm, Python 3 with pip and venv, and PostgreSQL. `npm install -g`
+and `pip install` install into the container's home folder, since it can't write to `/usr`.
+
+PostgreSQL isn't running until you (or Claude) run `pg-start`. The first time, it creates a
+database cluster in `~/.pgdata`, inside the container. The superuser is `postgres` with no
+password, so `psql` works as is, and apps can use
+`postgres://postgres@localhost:5432/postgres`. Stop it with `pg_ctl stop`. Like any background
+process, it's stopped when the container's last session ends, so run `pg-start` again in the next
+one. The data stays with the container; `--new` starts with an empty one.
+
+To open a dev server from your browser, start the container with `--ports`. Without a value it
+publishes 3000, 5173, 8000 and 8080; otherwise list them, as `port` or `host:container`:
+
+```sh
+bagn --ports                      # 3000, 5173, 8000, 8080
+bagn --ports=4200,15432:5432      # 4200, and postgres on localhost:15432 on your computer
+```
+
+Ports are published on `127.0.0.1` only, so other machines on your network can't reach them.
+A server in the container must listen on all interfaces (`0.0.0.0`), not `localhost`, e.g.
+`vite --host`, `next dev -H 0.0.0.0`, `python manage.py runserver 0.0.0.0:8000` or
+`uvicorn --host 0.0.0.0`.
+
+Ports can't be changed on an existing container. With `--ports`, only containers that publish
+exactly those ports are reused, and otherwise a new one is started. Without `--ports`, any of
+the folder's containers is reused, whatever it publishes. A port can only be published by one
+running container, and not while something on your computer uses it.
 
 ## Cursor and Salesforce CLIs
 
@@ -140,6 +173,7 @@ folder's Claude and Cursor logins and the orgs copied into that container.
 | Your SSH keys, git credentials, Docker socket, `~/.claude` | Not mounted. |
 | Git running planted code on your computer | `.git/config` and `.git/hooks` are mounted read-only, as are `config.worktree` files and the `config` and `hooks` of submodules in `.git/modules`, plus a `core.hooksPath` inside the folder (e.g. `.husky`). A missing `.git/hooks` is created first so it can't be added. Otherwise the container could add a hook or a `core.fsmonitor` command that runs the next time you use git on your computer. The protected paths are printed at startup. |
 | One project affecting others | Claude Code and Cursor config (hooks, MCP servers, settings, plugins, logins) is per folder, and Salesforce logins are per container. |
+| Dev servers and postgres seen from the network | Only published with `--ports`, and then only on `127.0.0.1`. |
 | Runaway processes | With `--limits`, memory, CPUs and the number of processes are capped. |
 | Container escape | All capabilities are dropped, `no-new-privileges` is set, and Claude runs as a non-root user. |
 
@@ -175,7 +209,7 @@ Defaults: `.env`, `.env.*` (except `.env.example`/`.sample`/`.template`), `.envr
 
 - `node_modules`, `.git`, `dist`, `.next` and similar folders are not scanned.
 - Only the current folder is mounted. If you start inside a monorepo subfolder, the repo root isn't visible.
-- Update Claude Code, Cursor and the Salesforce CLI with `bagn --rebuild`. It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
+- Update Claude Code, Cursor, the Salesforce CLI and the dev tools with `bagn --rebuild`. It rebuilds without Docker's layer cache, so it reinstalls the latest versions and pulls the latest base image.
 - Containers keep their own filesystem changes (e.g. tools installed in `~`) between sessions. Use `--new` for a clean one.
 - Background processes started in a session are stopped when the container's last session ends.
 - Since `.git/config` is read-only, git commands in the container that change it fail, e.g. `git remote add`, `git push -u`, `git branch --set-upstream-to` or installing hooks (`husky`, `pre-commit install`). Run those on your computer. Committing, branching, fetching and pushing work. A change to `.git/config` made on your computer shows up in a running container after it restarts (it stops when its last session ends).

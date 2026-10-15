@@ -22,12 +22,17 @@ const LABEL_FOLDER = 'bagn.folder';
 const LABEL_MOUNTS = 'bagn.mounts';
 const LABEL_SF = 'bagn.sf';
 const LABEL_ORG = 'bagn.org';
+const LABEL_PORTS = 'bagn.ports';
 // Part of the mounts hash. Bump it when createArgs mounts something
 // different, so older containers aren't reused.
 const MOUNTS_VERSION = 2;
 
 // --limits without a value. Defaults are lowered to fit what Docker has.
 const DEFAULT_LIMITS = { memory: '8g', cpus: '4', pids: '2048' };
+
+// --ports without a value: common dev server ports (Next/Express, Vite,
+// Django/FastAPI, misc).
+const DEFAULT_PORTS = '3000,5173,8000,8080';
 
 // Settings kept on this computer, e.g. { "agent": "cursor" }.
 const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'bagn', 'config.json');
@@ -112,6 +117,10 @@ Options:
                 Limit the container's memory, CPUs and processes. Applies to
                 a new container, and is changed on a reused one. Leave out
                 keys to use their defaults (lowered to what Docker has)
+  --ports[=${DEFAULT_PORTS}]
+                Publish container ports on this computer's 127.0.0.1, as
+                port or host:container. Only applies to a new container; a
+                container is reused only if it has the same ports
   --clean       Stop sessions left running after their terminal was closed,
                 and stop containers left without sessions
   --prune       Remove all stopped bagn containers
@@ -175,6 +184,7 @@ function parseArgs(argv) {
   const opts = Object.fromEntries(Object.values(FLAGS).map((key) => [key, false]));
   opts.sfOrgs = [];
   opts.limits = null;
+  opts.ports = null;
   const passArgs = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -194,6 +204,10 @@ function parseArgs(argv) {
     }
     if (arg === '--limits' || arg.startsWith('--limits=')) {
       opts.limits = parseLimits(arg === '--limits' ? '' : arg.slice('--limits='.length));
+      continue;
+    }
+    if (arg === '--ports' || arg.startsWith('--ports=')) {
+      opts.ports = parsePorts(arg === '--ports' ? DEFAULT_PORTS : arg.slice('--ports='.length));
       continue;
     }
     // Options were called --box-<name> before they were shortened.
@@ -224,6 +238,32 @@ function parseLimits(value) {
     limits.defaults.delete(key);
   }
   return limits;
+}
+
+// Parses "3000,8080:80" into a sorted list of "host:container" mappings, so
+// the same ports always give the same label.
+function parsePorts(value) {
+  const valid = (p) => /^\d+$/.test(p) && Number(p) >= 1 && Number(p) <= 65535;
+  const mappings = new Map();
+  for (const part of value.split(',').filter(Boolean)) {
+    const [host, container = host, extra] = part.split(':');
+    if (extra !== undefined || !valid(host) || !valid(container)) {
+      fail(`--ports: "${part}" is not a port or host:container, e.g. 3000 or 8080:80`);
+    }
+    if (mappings.has(Number(host)) && mappings.get(Number(host)) !== Number(container)) {
+      fail(`--ports: host port ${host} is given twice`);
+    }
+    mappings.set(Number(host), Number(container));
+  }
+  if (!mappings.size) fail('--ports needs at least one port');
+  return [...mappings].sort((a, b) => a[0] - b[0]).map(([h, c]) => `${h}:${c}`).join(',');
+}
+
+function portsText(ports) {
+  return ports.split(',').map((m) => {
+    const [h, c] = m.split(':');
+    return h === c ? h : `${h}->${c}`;
+  }).join(', ');
 }
 
 function globToRegExp(glob) {
@@ -605,6 +645,7 @@ function listContainers({ sessions = false } = {}) {
       image: c.Image,
       sf: c.Config.Labels[LABEL_SF] === '1',
       org: c.Config.Labels[LABEL_ORG] || null,
+      ports: c.Config.Labels[LABEL_PORTS] || null,
       limits: c.HostConfig.Memory || c.HostConfig.NanoCpus || c.HostConfig.PidsLimit > 0 ? {
         memory: c.HostConfig.Memory ? bytesText(c.HostConfig.Memory) : 'unlimited',
         cpus: c.HostConfig.NanoCpus ? String(c.HostConfig.NanoCpus / 1e9) : 'all',
@@ -629,6 +670,7 @@ function statusText(c) {
   if (c.running) status = c.sessions ? `in use (${c.sessions} session${c.sessions > 1 ? 's' : ''})` : 'running, idle';
   if (c.orphans) status += `, ${c.orphans} orphaned (bagn --clean)`;
   if (c.org) status += `, org ${c.org}`;
+  if (c.ports) status += `, ports ${portsText(c.ports)}`;
   if (c.limits) status += `, limits ${c.limits.memory}/${c.limits.cpus} CPUs/${c.limits.pids} procs`;
   return status;
 }
@@ -906,8 +948,9 @@ function containerOwner() {
 }
 
 // org is the alias or username of the container's default org, if any.
-// limits is from fitLimits, or null for none.
-function createArgs(name, folder, secrets, gitProtected, org, limits) {
+// limits is from fitLimits, or null for none. ports is from parsePorts, or
+// null for none.
+function createArgs(name, folder, secrets, gitProtected, org, limits, ports) {
   const workdir = containerPath(folder);
   const volumes = folderVolumes(folder);
   const args = [
@@ -925,6 +968,12 @@ function createArgs(name, folder, secrets, gitProtected, org, limits) {
   // Unlike a project's .sf/config.json, this applies to this container only.
   if (org) args.push('--label', `${LABEL_ORG}=${org}`, '-e', `SF_TARGET_ORG=${org}`);
   if (limits) args.push(...limitArgs(limits));
+  // Published on 127.0.0.1 only, so other machines on the network can't
+  // reach dev servers (or the passwordless postgres) in the container.
+  if (ports) {
+    args.push('--label', `${LABEL_PORTS}=${ports}`);
+    for (const m of ports.split(',')) args.push('-p', `127.0.0.1:${m}`);
+  }
 
   for (const s of secrets) {
     const target = path.posix.join(workdir, s.rel);
@@ -1186,7 +1235,7 @@ function main() {
     const gitProtected = scanGitProtected(cwd, secrets);
     printGitProtected(gitProtected);
     const name = containerName(cwd);
-    console.log(['docker', ...createArgs(name, cwd, secrets, gitProtected, null, opts.limits)].map(shellQuote).join(' '));
+    console.log(['docker', ...createArgs(name, cwd, secrets, gitProtected, null, opts.limits, opts.ports)].map(shellQuote).join(' '));
     for (const org of opts.sfOrgs) {
       const args = importArgs(name, { alias: org });
       console.log(`${['docker', ...args].map(shellQuote).join(' ')} < (sfdxAuthUrl from: sf org display -o ${shellQuote(org)} --verbose)`);
@@ -1252,11 +1301,19 @@ function main() {
     if (target.mounts !== hash) {
       fail(`${target.name}'s mounts are out of date (secret or git files in ${folder} changed, or bagn was updated). Run with --new from that folder.`);
     }
+    if (opts.ports && target.ports !== opts.ports) {
+      const has = target.ports ? `publishes ports ${portsText(target.ports)}` : "doesn't publish ports";
+      fail(`${target.name} ${has}, and ports can't be changed on an existing container. Run with --new from that folder.`);
+    }
   } else if (!opts.new) {
     const mine = listContainers().filter((c) => c.folder === folder);
-    const usable = mine.filter((c) => c.image === imageId && c.mounts === hash);
-    if (!usable.length && mine.length) {
+    const current = mine.filter((c) => c.image === imageId && c.mounts === hash);
+    // Without --ports any container will do, whatever it publishes.
+    const usable = current.filter((c) => !opts.ports || c.ports === opts.ports);
+    if (!current.length && mine.length) {
       console.error("bagn: this folder's containers are out of date (image rebuilt, secret or git files changed, or bagn updated)");
+    } else if (!usable.length && current.length) {
+      console.error(`bagn: none of this folder's containers publish ports ${portsText(opts.ports)}`);
     }
     if (usable.length && interactive()) {
       for (const c of usable) c.sessions = c.running ? sessionCount(c.name) : 0;
@@ -1269,6 +1326,8 @@ function main() {
   printSecrets(secrets);
   printGitProtected(gitProtected);
   if (limits) console.error(`bagn: limiting the container to ${limitsText(limits)}`);
+  const ports = target ? target.ports : opts.ports;
+  if (ports) console.error(`bagn: ports ${portsText(ports)} are published on 127.0.0.1 (servers in the container must listen on 0.0.0.0)`);
   let name;
   if (target) {
     name = target.name;
@@ -1292,7 +1351,13 @@ function main() {
     name = containerName(folder);
     console.error(`bagn: starting new container ${name}`);
     ensureFolderVolumes(folder);
-    if (docker(createArgs(name, folder, secrets, gitProtected, defaultOrg, limits), 'ignore').status !== 0) fail('docker run failed');
+    const res = spawnSync('docker', createArgs(name, folder, secrets, gitProtected, defaultOrg, limits, ports), { encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe'] });
+    if (res.status !== 0) {
+      // A port already in use leaves the container created but not running.
+      docker(['rm', '-f', name], 'ignore');
+      const busy = /port is already allocated|address already in use/i.test(res.stderr);
+      fail(busy ? `a port in ${portsText(ports)} is already in use on this computer. Choose others with --ports=...` : `docker run failed: ${res.stderr.trim()}`);
+    }
   }
 
   for (const org of orgs) {
