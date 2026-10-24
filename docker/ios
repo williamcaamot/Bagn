@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// Runs Xcode and the iOS Simulator on the Mac that started this container
+// with bagn --ios, through the bridge in that bagn session. BAGN_IOS_URL
+// and BAGN_IOS_TOKEN are set in --ios sessions only.
+'use strict';
+
+const fs = require('node:fs');
+const http = require('node:http');
+
+const HELP = `Usage: ios <command> [args] [--device <name|udid>]
+
+Runs Xcode and the iOS Simulator on the Mac that started this bagn session
+(bagn --ios). Builds and apps run on the Mac, not in the container.
+
+Commands:
+  status                    Xcode version and booted simulators
+  devices                   List available simulators
+  boot <name|udid>          Boot a simulator and show it in Simulator.app
+  shutdown [name|udid]      Shut down a simulator (default: the booted one)
+  open                      Bring Simulator.app to the front
+  build [xcodebuild args]   xcodebuild build, e.g. ios build -scheme MyApp
+  test [xcodebuild args]    xcodebuild test, e.g. ios test -scheme MyApp
+  xcodebuild [args]         Any allowed xcodebuild call, e.g. ios xcodebuild -list
+  install <path/App.app>    Install an app built in this folder
+  uninstall <bundle-id>     Remove an app
+  launch <bundle-id> [args] Launch an app, restarting it if it's running
+  terminate <bundle-id>     Stop an app
+  open-url <url>            Open a URL or deep link in the simulator
+  screenshot [file.png]     Save a screenshot (default: screenshot.png)
+  logs [--last 5m] [process]
+                            Show recent log messages, optionally from one
+                            process (the app's executable name)
+
+--device picks the simulator for any command (default: the booted one).
+
+xcodebuild:
+  Without -destination or -sdk, builds target the booted simulator (or any
+  iOS simulator if none is booted) and tests the booted one. Destinations and
+  SDKs must be simulators. Build output goes to .bagn/DerivedData in this
+  folder, so the app is at
+    .bagn/DerivedData/Build/Products/Debug-iphonesimulator/<App>.app
+  Allowed: the actions build, test, build-for-testing, test-without-building,
+  analyze and clean; -scheme, -target, -configuration, -project, -workspace
+  (inside this folder), -destination, -sdk, -arch, -testPlan, -only-testing,
+  -skip-testing, -resultBundlePath, -quiet, -list, -showBuildSettings,
+  -showdestinations, test and sanitizer options, and build settings
+  (KEY=VALUE). Not allowed: -derivedDataPath, -allowProvisioningUpdates,
+  -skipMacroValidation and -skipPackagePluginValidation (trust a package's
+  macros and plugins once in Xcode on the Mac instead).
+
+A typical run:
+  ios devices
+  ios boot "iPhone 16"
+  ios build -scheme MyApp -quiet
+  ios install .bagn/DerivedData/Build/Products/Debug-iphonesimulator/MyApp.app
+  ios launch com.example.MyApp
+  ios screenshot /tmp/screen.png`;
+
+function fail(msg, code = 1) {
+  console.error(`ios: ${msg}`);
+  process.exit(code);
+}
+
+function parse(argv) {
+  const args = [];
+  let device;
+  let last;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--device') device = argv[++i];
+    else if (argv[i].startsWith('--device=')) device = argv[i].slice('--device='.length);
+    else if (argv[i] === '--last') last = argv[++i];
+    else args.push(argv[i]);
+  }
+  if (device === '') fail('--device needs a simulator name or UDID');
+  return { args, device, last };
+}
+
+function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  if (!command || ['help', '-h', '--help'].includes(command)) {
+    console.log(HELP);
+    return;
+  }
+  const url = process.env.BAGN_IOS_URL;
+  const token = process.env.BAGN_IOS_TOKEN;
+  if (!url || !token) fail('no iOS bridge in this session. Start bagn with --ios on a Mac with Xcode.');
+
+  let { args, device, last } = parse(rest);
+  let out = null;
+  const needsArg = { install: 'an .app path', uninstall: 'a bundle id', launch: 'a bundle id', terminate: 'a bundle id', 'open-url': 'a URL' };
+  if (needsArg[command] && !args[0]) fail(`${command} needs ${needsArg[command]}`);
+  let send = command;
+  if (command === 'build' || command === 'test') {
+    send = 'xcodebuild';
+    args = [command, ...args];
+  } else if (command === 'screenshot') {
+    out = args[0] || 'screenshot.png';
+    args = [];
+  } else if (command === 'logs') {
+    args = [last || '5m', ...args];
+  }
+
+  const body = JSON.stringify({ command: send, args, device, cwd: process.cwd() });
+  const req = http.request(`${url}/run`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  }, (res) => {
+    if (res.statusCode !== 200) {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => fail(text.trim() || `bridge answered ${res.statusCode}`, 2));
+      return;
+    }
+    if (out) {
+      const file = fs.createWriteStream(out);
+      res.pipe(file);
+      file.on('finish', () => console.log(`ios: saved ${out}`));
+      file.on('error', (err) => fail(`could not write ${out}: ${err.message}`));
+      return;
+    }
+    res.pipe(process.stdout, { end: false });
+    res.on('end', () => {
+      const code = res.trailers['x-exit-code'];
+      if (code === undefined) fail('the bridge closed the connection before the command finished');
+      process.exitCode = Number(code);
+    });
+  });
+  req.on('error', (err) => {
+    fail(`can't reach the bridge at ${url} (${err.message}). It stops when the bagn --ios session that started it ends.`);
+  });
+  req.end(body);
+}
+
+main();

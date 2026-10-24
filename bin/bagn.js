@@ -37,6 +37,19 @@ const DEFAULT_PORTS = '3000,5173,8000,8080';
 // Settings kept on this computer, e.g. { "agent": "cursor" }.
 const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'bagn', 'config.json');
 
+// Every command the --ios bridge runs on this Mac is logged here.
+const IOS_LOG = path.join(os.homedir(), 'Library', 'Logs', 'bagn', 'ios.log');
+const IOS_WARNING = `bagn: --ios lets the container run Xcode and the iOS Simulator on this Mac.
+  This is NOT sandboxed. xcodebuild runs the project's build scripts, Swift
+  package plugins and macros, and the simulator runs the app, all as you on
+  this Mac, with access to your files, keychain and network. Anything in the
+  container can change the project, so with --ios it can run code on this
+  Mac. Only use it for projects you trust, and preferably without --yolo.
+  Commands run through the bridge are logged in ${IOS_LOG.replace(os.homedir(), '~')}.`;
+
+// Tells Claude about the ios command in --ios sessions.
+const IOS_PROMPT = 'This session has an iOS bridge: the `ios` command runs xcodebuild and the iOS Simulator on the Mac that started this container (the folder is shared). Run `ios help` for the commands. Use it to build, test, install, launch, screenshot and read logs of iOS apps. Xcode is not installed in the container itself.';
+
 // bagn was called claude-box. Its ignore file is still read, its Claude
 // volume is copied into bagn-claude once (to seed folder volumes from), and
 // --prune removes its stopped containers.
@@ -87,6 +100,8 @@ const DEFAULT_ALLOW = ['.env.example', '.env.sample', '.env.template', '*.pub'];
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.next', '.turbo', 'dist', 'build', 'out',
   '.venv', 'venv', '__pycache__', 'target', '.cache',
+  // --ios build output, including Swift package checkouts.
+  '.bagn',
 ]);
 
 const HELP = `bagn ${pkg.version}
@@ -121,6 +136,10 @@ Options:
                 Publish container ports on this computer's 127.0.0.1, as
                 port or host:container. Only applies to a new container; a
                 container is reused only if it has the same ports
+  --ios         Let the container build and run apps in the iOS Simulator on
+                this Mac, with the ios command (macOS with Xcode only). Builds
+                run on this Mac, outside the container; confirmed once per
+                folder
   --clean       Stop sessions left running after their terminal was closed,
                 and stop containers left without sessions
   --prune       Remove all stopped bagn containers
@@ -172,6 +191,7 @@ const FLAGS = {
   '--prune': 'prune',
   '--clean': 'clean',
   '--link-org': 'linkOrg',
+  '--ios': 'ios',
   '--api-key': 'apiKey',
   '--rebuild': 'rebuild',
   '--dry-run': 'dryRun',
@@ -717,14 +737,64 @@ function defaultAgent(ask) {
   const agent = agents[select('Which agent should bagn start by default?', [
     'Claude Code', 'Cursor CLI (cursor-agent)',
   ])];
-  try {
-    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
-    fs.writeFileSync(CONFIG_FILE, `${JSON.stringify({ ...config, agent }, null, 2)}\n`);
+  if (saveConfig({ ...config, agent })) {
     console.error(`bagn: saved in ${CONFIG_FILE}. Use --claude or --cursor to run the other one.`);
-  } catch (err) {
-    console.error(`bagn: could not save ${CONFIG_FILE} (${err.message}); you'll be asked again next time`);
   }
   return agent;
+}
+
+// Returns whether it was saved.
+function saveConfig(config) {
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
+    return true;
+  } catch (err) {
+    console.error(`bagn: could not save ${CONFIG_FILE} (${err.message}); you'll be asked again next time`);
+    return false;
+  }
+}
+
+function checkIosHost() {
+  if (process.platform !== 'darwin') fail('--ios needs macOS with Xcode: the iOS Simulator only runs on a Mac');
+  if (spawnSync('xcrun', ['--find', 'simctl'], { stdio: 'ignore' }).status !== 0) {
+    fail('--ios needs Xcode, not just the Command Line Tools. Install Xcode, then run: sudo xcode-select -s /Applications/Xcode.app');
+  }
+}
+
+// Shows the --ios warning, and the first time for a folder asks to confirm
+// it. Folders confirmed are saved in the config file.
+function confirmIos(folder) {
+  console.error(IOS_WARNING);
+  const config = readConfig();
+  const confirmed = Array.isArray(config.iosFolders) ? config.iosFolders : [];
+  if (confirmed.includes(folder)) return;
+  if (!interactive()) fail(`--ios must be confirmed once for ${folder} in an interactive terminal`);
+  if (prompt(`Allow --ios for ${folder}? Type yes to continue: `).toLowerCase() !== 'yes') {
+    console.error('bagn: cancelled');
+    process.exit(130);
+  }
+  saveConfig({ ...config, iosFolders: [...confirmed, folder] });
+}
+
+// Starts the --ios bridge (lib/ios-bridge.js) in a worker thread, which
+// keeps serving while this thread waits on docker exec, and stops when bagn
+// exits. Its address and token are put in the environment for execArgs.
+function startIosBridge(folder) {
+  const { Worker } = require('node:worker_threads');
+  const shared = new Int32Array(new SharedArrayBuffer(4));
+  const token = crypto.randomBytes(32).toString('hex');
+  const worker = new Worker(path.join(__dirname, '..', 'lib', 'ios-bridge.js'), {
+    workerData: { folder, workdir: containerPath(folder), token, shared, logFile: IOS_LOG },
+  });
+  worker.on('error', (err) => console.error(`bagn: the iOS bridge stopped: ${err.message}`));
+  worker.unref();
+  Atomics.wait(shared, 0, 0, 10000);
+  const port = Atomics.load(shared, 0);
+  if (port <= 0) fail('could not start the iOS bridge');
+  process.env.BAGN_IOS_URL = `http://host.docker.internal:${port}`;
+  process.env.BAGN_IOS_TOKEN = token;
+  console.error(`bagn: iOS bridge listening on 127.0.0.1:${port}; use the ios command in the container`);
 }
 
 // Reads a line from the terminal without opening stdin as a stream.
@@ -1007,6 +1077,8 @@ function execArgs(name, opts, command) {
     if (!process.env.ANTHROPIC_API_KEY) fail('--api-key given but ANTHROPIC_API_KEY is not set');
     args.push('-e', 'ANTHROPIC_API_KEY');
   }
+  // Set by startIosBridge.
+  if (opts.ios) args.push('-e', 'BAGN_IOS_URL', '-e', 'BAGN_IOS_TOKEN');
   // Lets later runs tell whether this session's terminal is still open.
   args.push('-e', `BAGN_HOST_PID=${process.pid}`);
   args.push(name, ...command);
@@ -1223,7 +1295,12 @@ function main() {
   let agent = 'claude';
   if (opts.cursor) agent = 'cursor';
   else if (!opts.claude && startsAgent) agent = defaultAgent(!opts.dryRun);
-  let command = ['claude', ...(opts.yolo ? ['--dangerously-skip-permissions'] : [])];
+  if (opts.ios && (startsAgent || opts.shell)) checkIosHost();
+  let command = [
+    'claude',
+    ...(opts.yolo ? ['--dangerously-skip-permissions'] : []),
+    ...(opts.ios ? ['--append-system-prompt', IOS_PROMPT] : []),
+  ];
   if (opts.shell) command = ['bash'];
   else if (agent === 'cursor') command = ['cursor-agent', ...(opts.yolo ? ['--yolo'] : [])];
   command.push(...passArgs);
@@ -1241,6 +1318,7 @@ function main() {
       console.log(`${['docker', ...args].map(shellQuote).join(' ')} < (sfdxAuthUrl from: sf org display -o ${shellQuote(org)} --verbose)`);
     }
     if (agent === 'cursor') console.log(['docker', ...cursorVolumeArgs(IMAGE, cwd)].map(shellQuote).join(' '));
+    if (opts.ios) console.log(`# --ios: BAGN_IOS_URL=http://host.docker.internal:<port> and BAGN_IOS_TOKEN from the bridge started by bagn (logged in ${IOS_LOG})`);
     console.log(['docker', ...execArgs(name, opts, command)].map(shellQuote).join(' '));
     return;
   }
@@ -1293,6 +1371,7 @@ function main() {
   const gitProtected = scanGitProtected(folder, secrets);
   const hash = mountsHash(folder, secrets, gitProtected);
   const limits = opts.limits && fitLimits(opts.limits);
+  if (opts.ios) confirmIos(folder);
 
   if (target) {
     if (target.image !== imageId) {
@@ -1373,6 +1452,7 @@ function main() {
     console.error(`bagn: could not set ownership of the ${folderVolumes(folder).cursor} volume; cursor-agent login may fail`);
   }
 
+  if (opts.ios) startIosBridge(folder);
   const res = docker(execArgs(name, opts, command));
   // Stop the container once its last session ends; it is started again on
   // the next reuse. Background processes left in it are stopped too.
