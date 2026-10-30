@@ -1,6 +1,6 @@
 {
   "name": "bagn",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Run Claude Code or the Cursor CLI in a Docker container scoped to the current folder, without leaking host env vars or secret files",
   "bin": {
     "bagn": "bin/bagn.js"
@@ -8,7 +8,8 @@
   "files": [
     "bin",
     "Dockerfile",
-    "docker"
+    "docker",
+    "lib"
   ],
   "engines": {
     "node": ">=18"

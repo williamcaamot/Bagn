@@ -48,8 +48,9 @@ RUN npm install -g @salesforce/cli \
  && ln -s /sf-config/sf /home/node/.sf \
  && ln -s /sf-config/sfdx /home/node/.sfdx
 
-COPY docker/pg-start /usr/local/bin/pg-start
-RUN chmod 755 /usr/local/bin/pg-start
+# ios talks to the bridge that bagn --ios starts on the Mac.
+COPY docker/pg-start docker/ios /usr/local/bin/
+RUN chmod 755 /usr/local/bin/pg-start /usr/local/bin/ios
 
 # pip and npm -g install into ~, since the container user can't write to
 # /usr. The container is throwaway, so pip may install outside a venv.

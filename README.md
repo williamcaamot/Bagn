@@ -12,6 +12,7 @@ npx bagn --shell                  # bash in the container instead of claude
 npx bagn --cursor                 # Cursor CLI instead of claude
 npx bagn --sf-org myscratch       # copy a scratch org's or sandbox's login from your sf
 npx bagn --ports                  # publish dev ports 3000, 5173, 8000, 8080
+npx bagn --ios                    # let it build and run iOS apps in the Simulator (macOS)
 npx bagn --help                   # all options
 npx bagn -- -p "summarize this"   # everything after -- goes to claude as is
 ```
@@ -59,6 +60,7 @@ newest ones count as live, one for each `docker exec` still running on your comp
 | `--link-org` | Pick a container, then one of the scratch orgs or sandboxes from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
 | `--limits[=memory=8g,cpus=4,pids=2048]` | Limit the container's memory (no swap), CPUs and number of processes, e.g. against a fork bomb or runaway build. Keys left out get the default shown, lowered to fit what Docker has. Applied when a container is created, and changed with `docker update` when one is reused |
 | `--ports[=3000,5173,8000,8080]` | Publish container ports on your computer's `127.0.0.1`, each as `port` or `host:container` (e.g. `--ports=3000,15432:5432`). See [Dev tools and ports](#dev-tools-and-ports) |
+| `--ios` | Let the container build and run apps in the iOS Simulator on your Mac, with the `ios` command. Builds run on your Mac, outside the container. See [iOS Simulator](#ios-simulator) |
 | `--clean` | Stop sessions left running after their terminal was closed, and stop containers left without sessions |
 | `--prune` | Remove all stopped bagn containers |
 
@@ -114,6 +116,51 @@ Ports can't be changed on an existing container. With `--ports`, only containers
 exactly those ports are reused, and otherwise a new one is started. Without `--ports`, any of
 the folder's containers is reused, whatever it publishes. A port can only be published by one
 running container, and not while something on your computer uses it.
+
+## iOS Simulator
+
+Xcode and the iOS Simulator only run on macOS, and a Docker container on a Mac is Linux, so
+they can't run in the container. Instead, `bagn --ios` starts a bridge on your Mac for the
+session, and the container's `ios` command asks it to run Xcode and the Simulator there:
+
+```sh
+ios devices                        # list simulators
+ios boot "iPhone 16"               # boot one and show it in Simulator.app
+ios build -scheme MyApp -quiet     # xcodebuild, targeting the booted simulator
+ios test -scheme MyApp
+ios install .bagn/DerivedData/Build/Products/Debug-iphonesimulator/MyApp.app
+ios launch com.example.MyApp
+ios screenshot /tmp/screen.png     # the file is saved in the container
+ios logs --last 2m MyApp
+```
+
+`ios help` lists everything. In `--ios` sessions, Claude Code is told about the `ios` command.
+
+**This gives up the container's isolation.** `xcodebuild` runs the project's build scripts,
+Swift package plugins and macros, and the simulator runs the app, all as you, on your Mac, with
+access to your files, keychain and network. Anything in the container can change the project, so
+with `--ios` it can run code on your Mac. Only use it for projects you trust, and preferably
+without `--yolo`. bagn shows this warning on every `--ios` run and asks you to confirm once per
+folder (saved in `~/.config/bagn/config.json` as `iosFolders`).
+
+What the bridge does limit:
+
+- It runs only `xcodebuild` and a fixed set of `simctl` commands, never a shell. Builds and tests
+  may only target simulators (`-destination` and `-sdk` are checked), and options like
+  `-derivedDataPath`, `-allowProvisioningUpdates`, `-skipMacroValidation` and
+  `-skipPackagePluginValidation` aren't allowed. To use a package's macros or plugins, trust them
+  once in Xcode on your Mac.
+- Paths it's given (`-project`, `-workspace`, apps to install, ...) must be inside the folder,
+  after following symlinks.
+- Build output goes to `.bagn/DerivedData` in the folder, so the container can see the built app.
+  bagn adds a `.bagn/.gitignore`, so git ignores it.
+- It listens on your Mac's `127.0.0.1` only, with a random token per session that's passed to the
+  container as `BAGN_IOS_TOKEN`. It stops when the session's `bagn` exits.
+- Every command it runs is logged in `~/Library/Logs/bagn/ios.log`.
+
+The container reaches the bridge at `host.docker.internal`, which Docker Desktop and OrbStack
+provide. `--ios` needs Xcode (not just the Command Line Tools): select it with
+`sudo xcode-select -s /Applications/Xcode.app`. The container has no Swift toolchain of its own.
 
 ## Cursor and Salesforce CLIs
 
@@ -207,6 +254,7 @@ Defaults: `.env`, `.env.*` (except `.env.example`/`.sample`/`.template`), `.envr
 - **Git history.** `.git` is mounted so git works. A secret that was ever committed can be read from history.
 - **Secrets in ordinary files.** Hard-coded keys in source code, or secret files with names that match no pattern, are visible.
 - **Files created after startup.** The scan runs when a session starts. A secret file created while a session is running stays visible until the next start, which then gets a new container.
+- **Your Mac, with `--ios`.** Builds and simulator apps run on your Mac, outside the container. See [iOS Simulator](#ios-simulator).
 - **Network.** The container has internet access (Claude needs it), so anything it can read could be sent out.
 - **Writes.** Claude can change or delete anything in the folder that isn't masked. Commit first.
 - **Other files your computer runs.** Only git's own config and hooks are read-only. Project files that tools on your computer run, such as `package.json` scripts, `Makefile`, `.vscode/tasks.json`, `.envrc` or a project's `.claude/settings.json` hooks, can still be changed. Review the diff before running anything from the folder on your computer.
