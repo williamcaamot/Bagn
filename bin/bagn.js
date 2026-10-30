@@ -107,12 +107,13 @@ Options:
   --cursor      Run the Cursor CLI (cursor-agent) this time, whatever the
                 default is
   --sf-org <org>
-                Copy the login for an org (alias or username) from sf on this
-                computer into the container's sf, keeping its alias. Repeat
-                for more orgs
-  --no-org      Don't ask for a scratch org when starting a new container
-  --link-org    Choose a container and a scratch org from sf on this
-                computer, and copy the org's login into the container
+                Copy the login for a scratch org or sandbox (alias or
+                username) from sf on this computer into the container's sf,
+                keeping its alias. Repeat for more orgs. Production orgs
+                are refused
+  --no-org      Don't ask for an org when starting a new container
+  --link-org    Choose a container and a scratch org or sandbox from sf on
+                this computer, and copy the org's login into the container
   --limits[=memory=8g,cpus=4,pids=2048]
                 Limit the container's memory, CPUs and processes. Applies to
                 a new container, and is changed on a reused one. Leave out
@@ -147,9 +148,10 @@ The answer is saved in ${CONFIG_FILE.replace(os.homedir(), '~')}; delete it to b
 asked again.
 
 Every container has the Salesforce CLI (sf). When a new container starts,
-you can pick one of the scratch orgs from sf on this computer: its login is
-copied in and it becomes the container's default org (SF_TARGET_ORG). sf
-logins stay in that container.
+you can pick one of the scratch orgs or sandboxes from sf on this computer:
+its login is copied in and it becomes the container's default org
+(SF_TARGET_ORG). sf logins stay in that container. Production orgs (including
+Dev Hubs) can't be copied in.
 
 Each folder has its own Claude Code and Cursor config (login, settings,
 history), shared by that folder's containers, so you log in once per folder.
@@ -1053,6 +1055,22 @@ function hostHasSf() {
   }));
 }
 
+// Asks the org itself whether it's a sandbox. Scratch orgs count as
+// sandboxes here too (IsSandbox is true for both), so only production orgs
+// fail. Returns null if the org is safe to copy, otherwise the reason. Any
+// doubt counts as production.
+function checkNotProduction(org) {
+  const res = hostSf(['data', 'query', '--query', 'SELECT IsSandbox FROM Organization', '--target-org', org]);
+  const record = res.status === 0 ? res.result?.records?.[0] : null;
+  if (!record) {
+    return `could not check whether ${org} is a sandbox (${sfMessage(res.message) || 'query failed'}), so it isn't copied`;
+  }
+  if (record.IsSandbox !== true) {
+    return `${org} is a production org. bagn only copies logins for scratch orgs and sandboxes`;
+  }
+  return null;
+}
+
 // Reads an org's login from sf on the host. The sfdxAuthUrl holds a refresh
 // token, which works anywhere, unlike the host's stored tokens: on macOS those
 // are encrypted with a key in the Keychain. onError gets the reason it failed,
@@ -1066,6 +1084,8 @@ function exportSfOrg(org, onError = fail) {
     return onError(`sf on this computer: ${sfMessage(info.message) || `could not read org ${org}`}`);
   }
   const { alias, username } = info.result;
+  const notSafe = checkNotProduction(username || org);
+  if (notSafe) return onError(notSafe);
   let url = info.result.sfdxAuthUrl;
   if (!url?.startsWith('force://')) url = hostSf(['org', 'auth', 'show-sfdx-auth-url', '--target-org', org]).result?.sfdxAuthUrl;
   if (!url?.startsWith('force://')) {
@@ -1130,49 +1150,76 @@ function stopIfIdle(name) {
   if (sessionCount(name) === 0) docker(['stop', '-t', '2', name], 'ignore');
 }
 
-// Lists the unexpired scratch orgs from sf on this computer. Returns
-// { orgs } or { error }.
-function hostScratchOrgs() {
-  console.error('bagn: reading scratch orgs from sf on this computer...');
+// The kind of a non-production org in sf org list's output, or null if it
+// looks like production. This only picks what to offer; exportSfOrg asks the
+// org itself before copying anything.
+function devOrgKind(o, inScratchList) {
+  const url = o.instanceUrl || '';
+  if (inScratchList || o.isScratch || /\.scratch\.my\.salesforce\.com/i.test(url)) return 'scratch';
+  if (o.isSandbox || /\.sandbox\.my\.salesforce\.com/i.test(url)) return 'sandbox';
+  return null;
+}
+
+// Lists the unexpired scratch orgs and the sandboxes from sf on this
+// computer, each with a kind. Returns { orgs } or { error }.
+function hostDevOrgs() {
+  console.error('bagn: reading scratch orgs and sandboxes from sf on this computer...');
   const list = hostSf(['org', 'list', '--skip-connection-status']);
   if (list.status !== 0 || !list.result) {
     return { error: list.missing ? list.message : `sf on this computer: ${sfMessage(list.message) || 'could not list orgs'}` };
   }
-  const scratch = list.result.scratchOrgs || [];
-  const orgs = scratch.filter((o) => !o.isExpired && o.status !== 'Deleted');
-  if (scratch.length > orgs.length) console.error(`bagn: leaving out ${scratch.length - orgs.length} expired scratch org(s)`);
+  const r = list.result;
+  const seen = new Set();
+  const orgs = [];
+  let expired = 0;
+  const groups = [[r.scratchOrgs, true], [r.sandboxes], [r.nonScratchOrgs], [r.other], [r.devHubs]];
+  for (const [group, inScratchList] of groups) {
+    for (const o of group || []) {
+      if (!o.username || seen.has(o.username)) continue;
+      seen.add(o.username);
+      const kind = devOrgKind(o, inScratchList);
+      if (!kind) continue;
+      if (kind === 'scratch' && (o.isExpired || o.status === 'Deleted')) {
+        expired++;
+        continue;
+      }
+      orgs.push({ ...o, kind });
+    }
+  }
+  if (expired) console.error(`bagn: leaving out ${expired} expired scratch org(s)`);
   return { orgs };
 }
 
-function scratchOrgItems(orgs) {
-  return formatTable(orgs.map((o) => [
-    o.alias || '(no alias)', o.username, o.expirationDate ? `expires ${o.expirationDate}` : '',
-  ]));
+function devOrgItems(orgs) {
+  return formatTable(orgs.map((o) => {
+    const expires = o.expirationDate || o.trailExpirationDate?.slice(0, 10);
+    return [o.alias || '(no alias)', o.username, o.kind, expires ? `expires ${expires}` : ''];
+  }));
 }
 
-// Offers the scratch orgs from sf on this computer for a new container, and
-// returns the chosen org's login, or null to start without one.
+// Offers the scratch orgs and sandboxes from sf on this computer for a new
+// container, and returns the chosen org's login, or null to start without one.
 function chooseNewContainerOrg() {
-  const { orgs, error } = hostScratchOrgs();
+  const { orgs, error } = hostDevOrgs();
   if (error) {
-    console.error(`bagn: ${error}; starting without a scratch org`);
+    console.error(`bagn: ${error}; starting without an org`);
     return null;
   }
   if (!orgs.length) {
-    console.error('bagn: no active scratch orgs on this computer; starting without one');
+    console.error('bagn: no active scratch orgs or sandboxes on this computer; starting without one');
     return null;
   }
-  const choice = select('Scratch org for the new container:', [...scratchOrgItems(orgs), '- None']);
+  const choice = select('Org for the new container:', [...devOrgItems(orgs), '- None']);
   const org = orgs[choice];
   if (!org) return null;
   return exportSfOrg(org.username, (msg) => {
     console.error(`bagn: ${msg}`);
-    console.error('bagn: starting without a scratch org');
+    console.error('bagn: starting without an org');
     return null;
   });
 }
 
-// Copies a scratch org's login from sf on this computer into a container
+// Copies a scratch org's or sandbox's login from sf on this computer into a container
 // that has sf, choosing both interactively.
 function linkOrg(cwd) {
   if (!interactive()) fail('--link-org needs an interactive terminal');
@@ -1180,12 +1227,12 @@ function linkOrg(cwd) {
   console.error('bagn: looking for containers with the Salesforce CLI...');
   const containers = listContainers({ sessions: true }).filter((c) => c.sf);
   if (!containers.length) fail('no containers have the Salesforce CLI. Start one with bagn --new');
-  const container = containers[select('Link a scratch org to which container?', containerItems(containers, cwd))];
+  const container = containers[select('Link an org to which container?', containerItems(containers, cwd))];
 
-  const { orgs, error } = hostScratchOrgs();
+  const { orgs, error } = hostDevOrgs();
   if (error) fail(error);
-  if (!orgs.length) fail('sf on this computer has no active scratch orgs');
-  const org = orgs[select('Which scratch org?', scratchOrgItems(orgs))];
+  if (!orgs.length) fail('sf on this computer has no active scratch orgs or sandboxes');
+  const org = orgs[select('Which org?', devOrgItems(orgs))];
   const label = org.alias || org.username;
 
   console.error(`bagn: reading the login for ${label} from sf on this computer...`);
@@ -1338,7 +1385,7 @@ function main() {
     }
     if (!target.running && docker(['start', name], 'ignore').status !== 0) fail(`could not start ${name}`);
   } else {
-    // A new container can start logged in to a scratch org, which becomes
+    // A new container can start logged in to a scratch org or sandbox, which becomes
     // its default org.
     let defaultOrg = null;
     if (!orgs.length && !opts.noOrg && interactive() && hostHasSf()) {

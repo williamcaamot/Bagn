@@ -10,7 +10,7 @@ npx bagn                          # interactive Claude Code
 npx bagn --yolo                   # claude --dangerously-skip-permissions
 npx bagn --shell                  # bash in the container instead of claude
 npx bagn --cursor                 # Cursor CLI instead of claude
-npx bagn --sf-org myscratch       # copy an org's login from your sf
+npx bagn --sf-org myscratch       # copy a scratch org's or sandbox's login from your sf
 npx bagn --ports                  # publish dev ports 3000, 5173, 8000, 8080
 npx bagn --help                   # all options
 npx bagn -- -p "summarize this"   # everything after -- goes to claude as is
@@ -54,9 +54,9 @@ newest ones count as live, one for each `docker exec` still running on your comp
 | `--shell` | Open `bash` in the container instead of `claude`. Combines with `--pick`/`--new` |
 | `--claude` | Run Claude Code this time, whatever the default is |
 | `--cursor` | Run the Cursor CLI (`cursor-agent`) this time, whatever the default is |
-| `--sf-org <org>` | Copy the login for an org from `sf` on your computer into the container's `sf`, keeping its alias. Repeatable |
-| `--no-org` | Don't ask for a scratch org when starting a new container |
-| `--link-org` | Pick a container, then one of the scratch orgs from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
+| `--sf-org <org>` | Copy the login for a scratch org or sandbox from `sf` on your computer into the container's `sf`, keeping its alias. Production orgs are refused. Repeatable |
+| `--no-org` | Don't ask for an org when starting a new container |
+| `--link-org` | Pick a container, then one of the scratch orgs or sandboxes from `sf` on your computer (↑/↓ and Enter), and copy that org's login into the container |
 | `--limits[=memory=8g,cpus=4,pids=2048]` | Limit the container's memory (no swap), CPUs and number of processes, e.g. against a fork bomb or runaway build. Keys left out get the default shown, lowered to fit what Docker has. Applied when a container is created, and changed with `docker update` when one is reused |
 | `--ports[=3000,5173,8000,8080]` | Publish container ports on your computer's `127.0.0.1`, each as `port` or `host:container` (e.g. `--ports=3000,15432:5432`). See [Dev tools and ports](#dev-tools-and-ports) |
 | `--clean` | Stop sessions left running after their terminal was closed, and stop containers left without sessions |
@@ -129,18 +129,25 @@ container itself, so a container can only use the orgs copied into it, and
 The old shared `bagn-sf` volume isn't used any more; delete it with `docker volume rm bagn-sf`.
 
 When bagn starts a new container in an interactive terminal, it lists the active scratch
-orgs from `sf` on your computer. Pick one (or "None") and its login is copied into the
+orgs and sandboxes from `sf` on your computer. Pick one (or "None") and its login is copied into the
 container, and it becomes that container's default org (`SF_TARGET_ORG`, shown in
-the container list), so each container can work against its own scratch org. This is
+the container list), so each container can work against its own org. This is
 skipped with `--sf-org` or `--no-org`, or if `sf` isn't installed on your computer.
 
-To use any other org you're already logged in to on your computer (e.g. a scratch org), copy its
+To use any other scratch org or sandbox you're already logged in to on your computer, copy its
 login in:
 
 ```sh
-bagn --sf-org myscratch                   # copy the login, then start claude
-bagn --sf-org myscratch --sf-org DevHub   # several orgs, e.g. its Dev Hub too
+bagn --sf-org myscratch                    # copy the login, then start claude
+bagn --sf-org myscratch --sf-org mysandbox # several orgs
 ```
+
+Production orgs can't be copied into a container, and that includes Dev Hubs, so create
+scratch orgs from your computer rather than from inside the container. Before copying a login, bagn
+asks the org itself (`SELECT IsSandbox FROM Organization`, which is true for both sandboxes
+and scratch orgs) and refuses if it isn't a sandbox or the check fails. The pickers only list orgs
+that `sf` marks as scratch orgs or sandboxes, or whose URL is a `.scratch.` or `.sandbox.` My
+Domain; to copy a sandbox that isn't listed, use `--sf-org`, which gets the same check.
 
 This reads the org's SFDX auth URL from `sf` on your computer (`sf org auth show-sfdx-auth-url`,
 or `sf org display --verbose` on older versions) and passes it on stdin to
